@@ -1,0 +1,10 @@
+zed_camera_id: 0
+frame_width: 1920
+frame_height: 1080
+mono_calibration_frames: 10
+stereo_calibration_frames: 10
+view_resize: 1
+checkerboard_box_size_scale : 3.832
+checkerboard_rows: 6
+checkerboard_columns: 8
+cooldown: 100
