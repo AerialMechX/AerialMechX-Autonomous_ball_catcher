@@ -32,42 +32,17 @@ from typing import Optional, Tuple, Dict
 
 # ==================== CONFIGURATION ====================
 
-RESOLUTION = sl.RESOLUTION.HD720
-FPS = 30
-DEPTH_MODE = sl.DEPTH_MODE.ULTRA
-UNIT = sl.UNIT.METER
-
-# HSV color ranges
-HSV_TENNIS_BALL = {
-    'lower': (29, 86, 6),
-    'upper': (64, 255, 255)
-}
-# orange
-# HSV_TENNIS_BALL = {
-#     'lower': (10, 100, 100),
-#     'upper': (25, 255, 255)
-# }
-HSV_PAPER_BALL = {
-    'lower': (50, 90, 90),
-    'upper': (60, 100, 100)
-}
-ACTIVE_HSV = HSV_TENNIS_BALL
-
-# Detection parameters
-MIN_BALL_AREA = 100
-MAX_BALL_AREA = 8000
-MIN_CIRCULARITY = 0.4
-
-# Coordinate offset corrections
-# CAMERA_HEIGHT_ABOVE_GROUND = 0.58
-# DEPTH_OFFSET = 1.9
-CAMERA_HEIGHT_ABOVE_GROUND = 0.0
-DEPTH_OFFSET = 0.0
+# Import configuration constants
+from config import (
+    RESOLUTION, FPS, DEPTH_MODE, UNIT,
+    HSV_TENNIS_BALL, HSV_PAPER_BALL, ACTIVE_HSV,
+    MIN_BALL_AREA, MAX_BALL_AREA, MIN_CIRCULARITY,
+    CAMERA_HEIGHT_ABOVE_GROUND, DEPTH_OFFSET,
+    DEFAULT_ROBOT_IP, DEFAULT_ROBOT_PORT, UDP_SEND_RATE
+)
 
 # Import UDP sender
-from sender import UDPSender, DEFAULT_ROBOT_IP, DEFAULT_ROBOT_PORT
-
-UDP_SEND_RATE = 30  # Hz - how often to send coordinates
+from sender import UDPSender
 
 
 # ==================== DATA CLASSES ====================

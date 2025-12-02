@@ -16,10 +16,8 @@ import time
 from typing import Optional
 import numpy as np
 
-
-# Default robot configuration
-DEFAULT_ROBOT_IP = "192.168.0.51"
-DEFAULT_ROBOT_PORT = 5005
+# Import configuration
+from config import DEFAULT_ROBOT_IP, DEFAULT_ROBOT_PORT
 
 
 class UDPSender:
