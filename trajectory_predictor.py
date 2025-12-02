@@ -44,33 +44,36 @@ from sender import UDPSender, DEFAULT_ROBOT_IP, DEFAULT_ROBOT_PORT
 
 # ==================== CONFIGURATION ====================
 
-# Physics constants
-GRAVITY = 9.81  # m/s^2
-
-# Trajectory prediction parameters
-MIN_POINTS_FOR_PREDICTION = 8  # Increased - need more points for reliable prediction
-MAX_TRAJECTORY_POINTS = 30  # Maximum points to keep in history
-TRAJECTORY_TIMEOUT = 2.0  # seconds - clear trajectory if no detection
-LANDING_HEIGHT = 0.0  # meters - ground level (y=0)
-
-# RANSAC parameters
-RANSAC_MIN_SAMPLES = 3
-RANSAC_RESIDUAL_THRESHOLD = 0.1  # meters
-RANSAC_MAX_TRIALS = 50
-
-# Throw detection thresholds
-THROW_VELOCITY_THRESHOLD = 1.5  # m/s - minimum velocity to consider a throw START
-THROW_CONFIRM_FRAMES = 3  # Need this many consecutive high-velocity frames to confirm throw
-MIN_TRAJECTORY_DURATION = 0.15  # seconds - minimum time of ball in flight before prediction
-
-# Prediction confidence
-MIN_PREDICTION_CONFIDENCE = 0.3
-
-# Performance: only run prediction every N frames
-PREDICTION_INTERVAL = 3  # Run prediction every 3 frames
-
-# Prediction log file (append mode)
-PREDICTION_LOG_FILE = "predictions.txt"
+# Import trajectory prediction configuration constants from config
+from config import (
+    # Physics constants
+    GRAVITY,
+    
+    # Trajectory collection parameters
+    MIN_POINTS_FOR_PREDICTION,
+    MAX_TRAJECTORY_POINTS,
+    TRAJECTORY_TIMEOUT,
+    LANDING_HEIGHT,
+    
+    # RANSAC parameters
+    RANSAC_MIN_SAMPLES,
+    RANSAC_RESIDUAL_THRESHOLD,
+    RANSAC_MAX_TRIALS,
+    
+    # Throw detection thresholds
+    THROW_VELOCITY_THRESHOLD,
+    THROW_CONFIRM_FRAMES,
+    MIN_TRAJECTORY_DURATION,
+    
+    # Prediction confidence
+    MIN_PREDICTION_CONFIDENCE,
+    
+    # Performance optimization
+    PREDICTION_INTERVAL,
+    
+    # Logging
+    PREDICTION_LOG_FILE
+)
 
 
 # ==================== DATA CLASSES ====================

@@ -53,37 +53,16 @@ except ImportError:
 
 # ==================== CONFIGURATION ====================
 
-# Camera defaults
-DEFAULT_WIDTH = 1280
-DEFAULT_HEIGHT = 720
-DEFAULT_FPS = 30
+# Import configuration constants from config
+from config import (
+    DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS,
+    ARUCO_DICT_MAP
+)
 
-# UDP Configuration
+# UDP Configuration (detect_aruco uses different defaults than other modules)
 DEFAULT_ROBOT_IP = "192.168.0.51"
 DEFAULT_ROBOT_PORT = 5006
 UDP_SEND_RATE = 30  # Hz
-
-# ==================== COORDINATE SYSTEM ====================
-# From camera's perspective:
-#   +X: Right
-#   +Y: Up
-#   +Z: Backward (into camera, away from scene)
-#
-# OpenCV/ArUco uses: +X right, +Y down, +Z forward
-# We transform: X_out = X, Y_out = -Y, Z_out = -Z
-
-# ArUco dictionary mapping
-ARUCO_DICT_MAP = {
-    '4x4': cv.aruco.DICT_4X4_250,
-    '5x5': cv.aruco.DICT_5X5_250,
-    '6x6': cv.aruco.DICT_6X6_250,
-    '7x7': cv.aruco.DICT_7X7_250,
-    # Also support with underscore
-    '4_4': cv.aruco.DICT_4X4_250,
-    '5_5': cv.aruco.DICT_5X5_250,
-    '6_6': cv.aruco.DICT_6X6_250,
-    '7_7': cv.aruco.DICT_7X7_250,
-}
 
 
 # ==================== DATA CLASSES ====================

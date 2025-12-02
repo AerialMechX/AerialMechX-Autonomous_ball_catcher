@@ -58,34 +58,20 @@ except ImportError:
 
 # ==================== CONFIGURATION ====================
 
-DEFAULT_WIDTH = 1280
-DEFAULT_HEIGHT = 720
-DEFAULT_FPS = 30
+# Import configuration constants from config
+from config import (
+    DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS,
+    ARUCO_DICTS,
+    FRONT_BACK_OFFSET, LEFT_RIGHT_OFFSET, MARKER_TILT_ANGLE
+)
 
-# UDP Configuration
-DEFAULT_ROBOT_IP = "192.168.0.51"
+# UDP Configuration (aruco_robot_tracker uses different defaults)
+DEFAULT_ROBOT_IP = "192.168.0.155"
 DEFAULT_ROBOT_PORT = 5006
 UDP_SEND_RATE = 30  # Hz
 
-# ==================== COORDINATE SYSTEM ====================
-# From camera's perspective:
-#   +X: Right
-#   +Y: Up  
-#   +Z: Backward (into camera, away from scene)
-#
-# OpenCV/ArUco uses: +X right, +Y down, +Z forward
-# We transform: X_out = X, Y_out = -Y, Z_out = -Z
 
-# ==================== ROBOT GEOMETRY ====================
-# Distances from marker center to robot center (in meters)
-FRONT_BACK_OFFSET = 0.0  # 14 cm
-LEFT_RIGHT_OFFSET = 0.0  # 16 cm
-
-# Marker tilt angle from vertical (degrees)
-MARKER_TILT_ANGLE = 45.0
-
-
-# ==================== MARKER CONFIGURATION ====================
+# ==================== DATA CLASSES ====================
 
 class MarkerSide(Enum):
     LEFT = "left"
@@ -103,17 +89,6 @@ class MarkerConfig:
     offset_to_center: np.ndarray  # Offset from marker to robot center in marker's local frame
     dict_name: str = ""
 
-
-# ArUco dictionary mapping
-ARUCO_DICTS = {
-    '4x4': cv.aruco.DICT_4X4_250,
-    '5x5': cv.aruco.DICT_5X5_250,
-    '6x6': cv.aruco.DICT_6X6_250,
-    '7x7': cv.aruco.DICT_7X7_250,
-}
-
-
-# ==================== DATA CLASSES ====================
 
 @dataclass
 class CameraIntrinsics:
