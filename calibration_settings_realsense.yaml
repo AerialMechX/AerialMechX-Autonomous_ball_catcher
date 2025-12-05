@@ -1,0 +1,31 @@
+# Dual RealSense Camera Calibration Settings
+# =========================================
+# Edit ONLY the serial numbers and checkerboard parameters to match your setup.
+
+# RealSense serial numbers (string, exactly as shown in RealSense Viewer)
+realsense_serial_0: "341522302002"
+realsense_serial_1: "213522253879"
+
+# Color stream settings (must match what you actually use)
+frame_width: 1280
+frame_height: 720
+fps: 30
+
+# Number of frames to use
+mono_calibration_frames: 40        # per camera, more is better
+stereo_calibration_frames: 40      # number of stereo pairs
+
+# How much to downscale display previews (1 = full size)
+view_resize: 2                     # 2 means display at 1/2 size
+
+# Seconds / iterations between auto captures (used as a frame counter)
+cooldown: 30                       # frames between captures, adjust as you like
+
+# Checkerboard parameters
+# These are INNER corners count (not squares count!)
+checkerboard_rows: 6               # number of inner corners along vertical
+checkerboard_cols: 8               # number of inner corners along horizontal
+
+# Physical size of one checker square in meters
+# e.g. 0.03832 ≈ 38.32 mm if you want the same as your old 3.832 cm value.
+square_size_m: 0.03832
