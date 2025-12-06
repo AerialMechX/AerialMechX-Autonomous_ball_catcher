@@ -72,7 +72,7 @@ class StereoCalibration:
         return float(np.linalg.norm(self.T))
 
 
-def load_calibration(calib_dir: str = "calib_output") -> StereoCalibration:
+def load_calibration(calib_dir: str = "../calib_output") -> StereoCalibration:
     """
     Load stereo calibration from directory.
     Tries YAML first, then NPZ.
@@ -172,7 +172,7 @@ def triangulate_point(
 if __name__ == "__main__":
     # Test loading
     try:
-        calib = load_calibration("calib_output")
+        calib = load_calibration("../calib_output")
         print(f"\nCalibration loaded successfully!")
         print(f"K0:\n{calib.K0}")
         print(f"K1:\n{calib.K1}")

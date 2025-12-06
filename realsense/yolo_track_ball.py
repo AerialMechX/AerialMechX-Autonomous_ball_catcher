@@ -30,7 +30,7 @@ HSV_UPPER = np.array([64, 255, 255])
 
 MIN_DEPTH = 0.3
 MAX_DEPTH = 5.0
-CALIB_DIR = "calib_output"
+CALIB_DIR = "../calib_output"
 MAX_FUSION_DISTANCE = 0.3
 # =========================================================
 

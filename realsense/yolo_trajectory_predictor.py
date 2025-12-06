@@ -37,7 +37,7 @@ GROUND_Y = 0.96
 MIN_POINTS = 3
 MIN_CONF_LOCK = 0.5
 
-CALIB_DIR = "calib_output"
+CALIB_DIR = "../calib_output"
 MAX_FUSION_DIST = 0.3
 # =========================================================
 

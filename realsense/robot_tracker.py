@@ -39,7 +39,7 @@ SIDE_YAW_OFFSET = {'LEFT': 90, 'FRONT': 0, 'RIGHT': -90, 'BACK': 180}
 MARKER_TO_CENTER = {'LEFT': 0.15, 'FRONT': 0.15, 'RIGHT': 0.15, 'BACK': 0.15}
 SIDE_COLORS = {'LEFT': (255,0,0), 'FRONT': (0,255,0), 'RIGHT': (0,0,255), 'BACK': (0,255,255)}
 
-CALIB_DIR = "calib_output"
+CALIB_DIR = "../calib_output"
 # =========================================================
 
 
