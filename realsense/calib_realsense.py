@@ -432,7 +432,7 @@ def stereo_calibrate(K0, dist0, K1, dist1):
 # -------------------------------------------------------------
 # Saving parameters
 # -------------------------------------------------------------
-def save_calibration_results(mono0, mono1, stereo_result, out_dir="calib_output"):
+def save_calibration_results(mono0, mono1, stereo_result, out_dir="../calib_output"):
     os.makedirs(out_dir, exist_ok=True)
 
     K0, dist0, rms0 = mono0
