@@ -1,4 +1,6 @@
 __pycache__
-ball_tracking_log.csv
-landing_predictions.csv
-predictions.txt
+zed2i/ball_tracking_log.csv
+zed2i/landing_predictions.csv
+zed2i/predictions.txt
+realsense/yolo5_last.pt
+realsense/yolov8n.pt
