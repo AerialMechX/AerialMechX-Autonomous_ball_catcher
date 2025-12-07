@@ -1,827 +1,853 @@
-"""
-Ball Catcher Integration System (OPTIMIZED)
-
-Integrates trajectory prediction and robot tracking to enable a robot to catch thrown balls.
-This module combines:
-- Ball trajectory prediction from trajectory_predictor.py
-- Robot pose tracking from aruco_robot_tracker.py  
-- Combined UDP communication to send both ball landing and robot pose data
-
-PERFORMANCE OPTIMIZATIONS:
-- Configurable depth mode (PERFORMANCE vs ULTRA)
-- Downscaled ball detection with coordinate rescaling
-- Reduced depth sampling points
-- Lazy visualization updates
-- Pre-allocated buffers
-- Moved imports to module level
-- Configurable robot tracking frequency
-- Optional threading for ArUco detection
-
-COORDINATE SYSTEM (from camera's perspective):
-    +X: Right
-    +Y: Up
-    +Z: Backward (into camera, away from scene)
-
-UDP DATA FORMAT (40 bytes total):
-    - Ball landing position: 3 floats (x, y, z) = 12 bytes
-    - Ball prediction confidence: 1 float = 4 bytes
-    - Robot pose: 6 floats (x, y, z, roll, pitch, yaw) = 24 bytes
-
-Requirements:
-    pip install opencv-contrib-python numpy pyzed filterpy scikit-learn
-
-Usage:
-    python ball_catcher.py --marker-size 95
-    python ball_catcher.py --marker-size 95 --robot-ip 192.168.0.155 --robot-port 5005
-    python ball_catcher.py --marker-size 95 --no-udp --debug
-    python ball_catcher.py --marker-size 95 --fast-depth  # Use PERFORMANCE depth mode
-
-Controls:
-    q/ESC - Quit
-    r - Reset trajectory prediction
-    c - Calibrate/set robot origin
-    u - Toggle UDP sending
-    d - Toggle debug visualization
-"""
-
+#!/usr/bin/env python3
+import pyzed.sl as sl
 import cv2 as cv
 import numpy as np
-import argparse
 import time
-import struct
-from typing import Optional, Tuple
-from threading import Thread, Lock
 from collections import deque
+import random
+import socket
+import struct
+from typing import Optional, Dict, List, Tuple
 
-import warnings
-warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+# ===========================
+# CONSTANTS - BALL / PHYSICS
+# ===========================
+G = 9.81
+GROUND_Y = -0.52
+MIN_SAMPLES = 3
+RANSAC_ITERS = 150
+RANSAC_INLIER_THRESH = 0.03
+MAX_HISTORY = 60
 
-# Import ZED SDK
-try:
-    import pyzed.sl as sl
-    ZED_AVAILABLE = True
-except ImportError:
-    ZED_AVAILABLE = False
-    print("ERROR: ZED SDK not available. This module requires ZED camera.")
-    exit(1)
+# Velocity filters
+VEL_WIN = 7                  # frames to average velocity over
+THROW_SPEED_THRESH = 0.80    # relaxed from 1.4 m/s
+THROW_UPWARD_VY_THRESH = 0.4 # relaxed from 0.7 m/s
+THROW_VERIFY_FRAMES = 3      # relaxed from 4 frames
 
-# Import existing components - moved to module level for performance
-from trajectory_predictor import TrajectoryPredictor, LandingPrediction
-from ball_tracker_params import (
-    BallDetector, 
-    CameraIntrinsics as BallCameraIntrinsics,
-    get_robust_depth,
-    draw_detection
-)
-from aruco_robot_tracker import (
-    MultiMarkerRobotTracker, 
-    Pose as RobotPose,
-    CameraIntrinsics as RobotCameraIntrinsics
-)
-from sender import UDPSender
-from config import (
-    RESOLUTION, FPS, DEPTH_MODE, UNIT,
-    DEFAULT_ROBOT_IP, DEFAULT_ROBOT_PORT,
-    ACTIVE_HSV, CAMERA_HEIGHT_ABOVE_GROUND, DEPTH_OFFSET,
-    MIN_BALL_AREA, MAX_BALL_AREA, MIN_CIRCULARITY
-)
+# ===========================
+# CAMERA CONFIG
+# ===========================
+INTR0_PATH = "./camera_parameters/camera0_intrinsics.dat"
+INTR1_PATH = "./camera_parameters/camera1_intrinsics.dat"
+EXTR1_PATH = "./camera_parameters/camera1_rot_trans.dat"
+
+HSV_LOWER = np.array([29, 86, 6])
+HSV_UPPER = np.array([64, 255, 255])
+
+MIN_AREA = 80
+MAX_AREA = 50000
+MIN_CIRC = 0.35
+
+SMOOTH_ALPHA = 0.4
+
+# ===========================
+# UDP CONFIG
+# ===========================
+DEFAULT_ROBOT_PORT = 5005
+DEFAULT_ROBOT_IP = "192.168.0.155"
+UDP_RATE_LIMIT_HZ = 30.0
+
+# ===========================
+# PERFORMANCE CONFIG
+# ===========================
+ARUCO_UPDATE_EVERY = 3   # run ArUco only every N frames (reuse last pose between updates)
 
 
-# ==================== OPTIMIZED BALL DETECTOR ====================
+# ===========================
+# UTIL: LOAD INTRINSICS / EXTRINSICS (.dat)
+# ===========================
 
-class FastBallDetector:
-    """
-    Optimized ball detector with downscaling support.
-    Processes images at reduced resolution for faster detection.
-    """
-    
-    def __init__(self, hsv_config: dict, scale: float = 0.5):
-        """
-        Initialize fast ball detector.
-        
-        Args:
-            hsv_config: HSV color range configuration
-            scale: Downscale factor (0.5 = half resolution, 1.0 = full)
-        """
-        self.lower = np.array(hsv_config['lower'], dtype=np.uint8)
-        self.upper = np.array(hsv_config['upper'], dtype=np.uint8)
-        self.kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (3, 3))  # Smaller kernel
-        self.scale = scale
-        self.inv_scale = 1.0 / scale
-        
-        # Scaled area thresholds
-        self.min_area = int(MIN_BALL_AREA * scale * scale)
-        self.max_area = int(MAX_BALL_AREA * scale * scale)
-        
-        # Pre-allocate arrays for reuse
-        self._mask = None
-        
-    def set_hsv_range(self, lower: tuple, upper: tuple):
-        self.lower = np.array(lower, dtype=np.uint8)
-        self.upper = np.array(upper, dtype=np.uint8)
-    
-    def detect(self, frame_hsv: np.ndarray) -> Optional[Tuple[int, int, int]]:
-        """
-        Detect ball in HSV frame with optional downscaling.
-        
-        Args:
-            frame_hsv: HSV frame (pre-converted for efficiency)
-            
-        Returns:
-            (x, y, radius) in original frame coordinates, or None
-        """
-        # Downscale if needed
-        if self.scale < 1.0:
-            h, w = frame_hsv.shape[:2]
-            new_w, new_h = int(w * self.scale), int(h * self.scale)
-            hsv = cv.resize(frame_hsv, (new_w, new_h), interpolation=cv.INTER_LINEAR)
+def load_intrinsics_dat(path):
+    with open(path, "r") as f:
+        lines = [l.strip() for l in f.readlines() if l.strip()]
+
+    K_rows, D_vals = [], []
+    mode = None
+    for line in lines:
+        if line.startswith("intrinsic"):
+            mode = "K"
+            continue
+        if line.startswith("distortion"):
+            mode = "D"
+            continue
+        vals = [float(x) for x in line.replace(",", " ").split()]
+        if mode == "K":
+            K_rows.append(vals)
         else:
-            hsv = frame_hsv
-        
-        # Create mask
-        mask = cv.inRange(hsv, self.lower, self.upper)
-        
-        # Morphological operations (single pass each)
-        mask = cv.erode(mask, self.kernel, iterations=1)
-        mask = cv.dilate(mask, self.kernel, iterations=1)
-        
-        # Find contours
-        contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            return None
-        
-        best_detection = None
-        best_score = 0
-        
-        for contour in contours:
-            area = cv.contourArea(contour)
-            if area < self.min_area or area > self.max_area:
-                continue
-            
-            perimeter = cv.arcLength(contour, True)
-            if perimeter == 0:
-                continue
-            
-            circularity = 4 * np.pi * area / (perimeter ** 2)
-            if circularity < MIN_CIRCULARITY:
-                continue
-            
-            (x, y), radius = cv.minEnclosingCircle(contour)
-            
-            score = circularity * area
-            if score > best_score:
-                best_score = score
-                # Scale coordinates back to original resolution
-                best_detection = (
-                    int(x * self.inv_scale),
-                    int(y * self.inv_scale),
-                    int(radius * self.inv_scale)
-                )
-        
-        return best_detection
+            D_vals.extend(vals)
+
+    K = np.array(K_rows, dtype=np.float64)
+    D = np.array(D_vals[:5], dtype=np.float64).reshape(-1, 1)
+    return K, D
 
 
-# ==================== OPTIMIZED DEPTH FUNCTION ====================
+def load_extrinsics_dat(path):
+    with open(path, "r") as f:
+        lines = [l.strip() for l in f.readlines() if l.strip()]
 
-def get_fast_depth(point_cloud: sl.Mat, x: int, y: int, 
-                   sample_radius: int = 3) -> Optional[np.ndarray]:
-    """
-    Fast 3D position retrieval with minimal sampling.
-    
-    Args:
-        point_cloud: ZED point cloud
-        x, y: Pixel coordinates
-        sample_radius: Sampling radius (reduced from 5 to 3)
-        
-    Returns:
-        3D position [x, y, z] or None
-    """
-    h, w = point_cloud.get_height(), point_cloud.get_width()
-    
-    # Try center point first (fastest path)
-    err, point = point_cloud.get_value(x, y)
-    if err == sl.ERROR_CODE.SUCCESS and np.isfinite(point[2]) and point[2] > 0:
-        return np.array(point[:3], dtype=np.float32)
-    
-    # Sample sparse grid (9 points instead of 36)
-    valid_points = []
-    for dy in range(-sample_radius, sample_radius + 1, sample_radius):
-        for dx in range(-sample_radius, sample_radius + 1, sample_radius):
-            px, py = x + dx, y + dy
-            if 0 <= px < w and 0 <= py < h:
-                err, point = point_cloud.get_value(px, py)
-                if err == sl.ERROR_CODE.SUCCESS and np.isfinite(point[2]) and point[2] > 0:
-                    valid_points.append(point[:3])
-    
-    if not valid_points:
-        return None
-    
-    # Use median for robustness
-    return np.median(valid_points, axis=0).astype(np.float32)
+    R_rows, T_vals = [], []
+    mode = None
+    for line in lines:
+        if line.startswith("R"):
+            mode = "R"
+            continue
+        if line.startswith("T"):
+            mode = "T"
+            continue
+        vals = [float(x) for x in line.replace(",", " ").split()]
+        if mode == "R":
+            R_rows.append(vals)
+        else:
+            T_vals.extend(vals)
+
+    R = np.array(R_rows, dtype=np.float64)
+    T = np.array(T_vals, dtype=np.float64).reshape(3, 1)
+    return R, T
 
 
-# ==================== COMBINED UDP SENDER ====================
+# ===========================
+# UDP SENDER
+# ===========================
 
-class CombinedUDPSender(UDPSender):
-    """Enhanced UDP sender that sends combined ball + robot data"""
-    
+class UDPSender:
     def __init__(self, robot_ip: str = DEFAULT_ROBOT_IP, port: int = DEFAULT_ROBOT_PORT,
-                 rate_limit: float = 60.0):
-        super().__init__(robot_ip, port, rate_limit=rate_limit)
-        # Pre-allocate pack buffer
-        self._data_buffer = bytearray(40)
-    
-    def send_combined_data(self, 
-                          ball_landing: Optional[np.ndarray] = None,
-                          ball_confidence: float = 0.0,
-                          robot_pose: Optional[RobotPose] = None) -> bool:
-        """
-        Send combined ball landing prediction and robot pose data.
-        
-        Packet format (40 bytes):
-            - Ball landing (x, y, z): 3 floats (12 bytes)
-            - Ball confidence: 1 float (4 bytes)
-            - Robot pose (x, y, z, roll, pitch, yaw): 6 floats (24 bytes)
-        """
+                 rate_limit: Optional[float] = None):
+        self.robot_ip = robot_ip
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.enabled = True
+        self.packets_sent = 0
+
+        self.rate_limit = rate_limit
+        self.last_send_time = 0.0
+        self.min_send_interval = (1.0 / rate_limit) if rate_limit else 0.0
+
+    def _rate_ok(self) -> bool:
+        if not self.rate_limit:
+            return True
+        now = time.time()
+        if (now - self.last_send_time) < self.min_send_interval:
+            return False
+        self.last_send_time = now
+        return True
+
+    def send_robot_pose(self, x: float, y: float, z: float, yaw: float) -> bool:
         if not self.enabled:
             return False
-        
-        # Check rate limit
-        current_time = time.time()
-        if current_time - self.last_send_time < self.min_send_interval:
+        if not self._rate_ok():
             return False
-        
         try:
-            # Prepare ball data
-            if ball_landing is not None and len(ball_landing) >= 3:
-                ball_x, ball_y, ball_z = float(ball_landing[0]), float(ball_landing[1]), float(ball_landing[2])
-            else:
-                ball_x, ball_y, ball_z = 0.0, 0.0, 0.0
-                ball_confidence = 0.0
-            
-            # Prepare robot data
-            if robot_pose is not None:
-                robot_x, robot_y, robot_z = float(robot_pose.x), float(robot_pose.y), float(robot_pose.z)
-                robot_roll, robot_pitch, robot_yaw = float(robot_pose.roll), float(robot_pose.pitch), float(robot_pose.yaw)
-            else:
-                robot_x, robot_y, robot_z = 0.0, 0.0, 0.0
-                robot_roll, robot_pitch, robot_yaw = 0.0, 0.0, 0.0
-            
-            # Pack data: 10 floats = 40 bytes
-            data = struct.pack('10f',
-                             ball_x, ball_y, ball_z, float(ball_confidence),
-                             robot_x, robot_y, robot_z, 
-                             robot_roll, robot_pitch, robot_yaw)
-            
-            self.sock.sendto(data, (self.robot_ip, self.port))
+            packet = struct.pack('4f', x, y, z, yaw)
+            self.sock.sendto(packet, (self.robot_ip, self.port))
             self.packets_sent += 1
-            self.last_send_time = current_time
             return True
-            
         except Exception as e:
-            # Silently fail to avoid console spam
+            print(f"[UDP ERROR] Failed to send robot pose: {e}")
             return False
 
-
-# ==================== THREADED ARUCO TRACKER ====================
-
-class ThreadedArucoTracker:
-    """
-    Runs ArUco detection in a separate thread to avoid blocking main loop.
-    """
-    
-    def __init__(self, tracker: MultiMarkerRobotTracker):
-        self.tracker = tracker
-        self.lock = Lock()
-        self.latest_pose = None
-        self.latest_detections = []
-        self.frame_queue = None
-        self.running = False
-        self.thread = None
-        
-    def start(self):
-        """Start background tracking thread"""
-        self.running = True
-        self.thread = Thread(target=self._run, daemon=True)
-        self.thread.start()
-        
-    def stop(self):
-        """Stop background tracking thread"""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
-    
-    def update_frame(self, frame: np.ndarray):
-        """Submit frame for processing (non-blocking)"""
-        with self.lock:
-            self.frame_queue = frame.copy()
-    
-    def _run(self):
-        """Background processing loop"""
-        while self.running:
-            frame = None
-            with self.lock:
-                if self.frame_queue is not None:
-                    frame = self.frame_queue
-                    self.frame_queue = None
-            
-            if frame is not None:
-                pose, detections = self.tracker.update(frame)
-                with self.lock:
-                    self.latest_pose = pose
-                    self.latest_detections = detections
-            else:
-                time.sleep(0.001)  # Prevent busy-waiting
-    
-    def get_pose(self) -> Tuple[Optional[RobotPose], list]:
-        """Get latest pose (non-blocking)"""
-        with self.lock:
-            return self.latest_pose, self.latest_detections
-
-
-# ==================== BALL CATCHER SYSTEM ====================
-
-class BallCatcherSystem:
-    """Main integration class coordinating ball tracking and robot tracking"""
-    
-    def __init__(self, 
-                 marker_size_mm: float,
-                 left_id: int = 0, front_id: int = 0, right_id: int = 0, back_id: int = 0,
-                 robot_ip: str = DEFAULT_ROBOT_IP,
-                 robot_port: int = DEFAULT_ROBOT_PORT,
-                 enable_udp: bool = True,
-                 debug: bool = False,
-                 fast_depth: bool = False,
-                 detection_scale: float = 0.5,
-                 robot_track_interval: int = 4,
-                 use_threaded_aruco: bool = False):
-        
-        self.debug = debug
-        self.detection_scale = detection_scale
-        self.robot_track_interval = robot_track_interval
-        self.use_threaded_aruco = use_threaded_aruco
-        
-        # Initialize ZED camera
-        print("\nInitializing ZED camera...")
-        self.zed = sl.Camera()
-        
-        init_params = sl.InitParameters()
-        init_params.camera_resolution = RESOLUTION
-        init_params.camera_fps = FPS
-        init_params.coordinate_units = UNIT
-        
-        # Use faster depth mode if requested
-        if fast_depth:
-            init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
-            print("  Using PERFORMANCE depth mode (faster)")
-        else:
-            init_params.depth_mode = DEPTH_MODE
-            print(f"  Using {DEPTH_MODE} depth mode")
-        
-        status = self.zed.open(init_params)
-        if status != sl.ERROR_CODE.SUCCESS:
-            print(f"ERROR: Failed to open ZED camera: {status}")
-            exit(1)
-        
-        print("✓ ZED camera initialized")
-        
-        # Get camera intrinsics
-        cam_info = self.zed.get_camera_information()
-        
+    def send_predicted_landing(self, x: float, y: float, z: float) -> bool:
+        if not self.enabled:
+            return False
+        # no rate limit for predicted landing
         try:
-            calib = cam_info.camera_configuration.calibration_parameters.left_cam
-        except AttributeError:
-            try:
-                calib = cam_info.calibration_parameters.left_cam
-            except:
-                print("ERROR: Failed to get camera calibration parameters")
-                self.zed.close()
-                exit(1)
-        
-        try:
-            res = cam_info.camera_configuration.camera_resolution
-            width, height = res.width, res.height
-        except:
-            width, height = 1280, 720
-        
-        fx, fy = calib.fx, calib.fy
-        cx, cy = calib.cx, calib.cy
-        
-        try:
-            dist = np.array(calib.disto[:5], dtype=np.float32)
-        except:
-            dist = np.zeros(5, dtype=np.float32)
-        
-        # Create camera intrinsics
-        ball_intrinsics = BallCameraIntrinsics(
-            fx=fx, fy=fy, cx=cx, cy=cy,
-            width=width, height=height
-        )
-        
-        robot_intrinsics = RobotCameraIntrinsics(
-            fx=fx, fy=fy, cx=cx, cy=cy,
-            width=width, height=height,
-            dist_coeffs=dist
-        )
-        
-        print(f"✓ Camera resolution: {width}x{height}")
-        
-        # Initialize FAST ball tracking components
-        print("\nInitializing optimized ball tracker...")
-        self.ball_detector = FastBallDetector(ACTIVE_HSV, scale=detection_scale)
-        self.trajectory_predictor = TrajectoryPredictor(debug=debug)
-        self.ball_intrinsics = ball_intrinsics
-        print(f"✓ Ball tracker initialized (detection scale: {detection_scale})")
-        
-        # Initialize robot tracking
-        print("\nInitializing robot tracker...")
-        self.robot_tracker = MultiMarkerRobotTracker(
-            intrinsics=robot_intrinsics,
-            marker_size_mm=marker_size_mm,
-            left_id=left_id,
-            front_id=front_id,
-            right_id=right_id,
-            back_id=back_id
-        )
-        
-        # Optionally use threaded ArUco detection
-        self.threaded_tracker = None
-        if use_threaded_aruco:
-            self.threaded_tracker = ThreadedArucoTracker(self.robot_tracker)
-            self.threaded_tracker.start()
-            print(f"✓ Robot tracker initialized (threaded, marker size: {marker_size_mm}mm)")
-        else:
-            print(f"✓ Robot tracker initialized (interval: every {robot_track_interval} frames)")
-        
-        # Initialize combined UDP sender with higher rate limit
-        self.udp_sender = CombinedUDPSender(robot_ip=robot_ip, port=robot_port, rate_limit=60.0)
-        if not enable_udp:
-            self.udp_sender.enabled = False
-        
-        print(f"\n{'✓' if self.udp_sender.enabled else '✗'} UDP: {robot_ip}:{robot_port}")
-        
-        # ZED image containers - pre-allocate
-        self.image_left = sl.Mat()
-        self.point_cloud = sl.Mat()
-        self.runtime = sl.RuntimeParameters()
-        self.runtime.confidence_threshold = 50
-        
-        # Pre-allocate processing buffers (reused each frame)
-        self.hsv_frame = None  # Will be allocated on first frame
-        
-        # State
-        self.current_prediction = None
-        self.current_robot_pose = None
-        self.current_detections = []
-        self.frame_count = 0
-        self.start_time = time.time()
-        self.prediction_locked = False
-        
-        # Performance tracking
-        self.fps_history = deque(maxlen=30)
-        self.last_frame_time = time.time()
-        
-        # Visualization update interval (reduce text rendering overhead)
-        self.viz_update_interval = 3
-        self._cached_overlay_data = {}
-        
-    def process_frame(self) -> Optional[np.ndarray]:
-        """Process one frame: detect ball, track robot, send UDP"""
-        
-        # Timing for FPS
-        current_time = time.time()
-        frame_dt = current_time - self.last_frame_time
-        self.last_frame_time = current_time
-        if frame_dt > 0:
-            self.fps_history.append(1.0 / frame_dt)
-        
-        # Grab frame from ZED
-        if self.zed.grab(self.runtime) != sl.ERROR_CODE.SUCCESS:
-            return None
-        
-        # Retrieve image (always needed)
-        self.zed.retrieve_image(self.image_left, sl.VIEW.LEFT)
-        frame = self.image_left.get_data()
-        
-        if frame is None:
-            return None
-        
-        # Get BGR frame (ZED returns BGRA) - make contiguous copy for OpenCV
-        frame_bgr = frame[:, :, :3].copy()
-        
-        self.frame_count += 1
-        
-        # Convert to HSV once (reuse pre-allocated buffer if possible)
-        if self.hsv_frame is None or self.hsv_frame.shape[:2] != frame_bgr.shape[:2]:
-            self.hsv_frame = cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV)
-        else:
-            cv.cvtColor(frame_bgr, cv.COLOR_BGR2HSV, dst=self.hsv_frame)
-        
-        # ===== BALL TRACKING (OPTIMIZED) =====
-        ball_pos = None
-        detection = None
-        
-        # Detect ball using fast detector (pass HSV directly)
-        detection = self.ball_detector.detect(self.hsv_frame)
-        
-        if detection:
-            x, y, radius = detection
-            
-            # Only retrieve point cloud when ball is detected
-            self.zed.retrieve_measure(self.point_cloud, sl.MEASURE.XYZRGBA)
-            
-            # Get 3D position using fast depth
-            ball_pos = get_fast_depth(self.point_cloud, x, y, sample_radius=3)
-            
-            if ball_pos is not None:
-                # Apply coordinate offset corrections
-                ball_pos[1] += CAMERA_HEIGHT_ABOVE_GROUND
-                ball_pos[2] += DEPTH_OFFSET
-                
-                # Only add to trajectory predictor if not locked
-                if not self.prediction_locked:
-                    self.trajectory_predictor.add_point(ball_pos, current_time)
-        
-        # Predict landing only if not locked (every 3 frames)
-        if not self.prediction_locked and self.frame_count % 3 == 0:
-            if self.trajectory_predictor.can_predict():
-                new_prediction = self.trajectory_predictor.predict_landing()
-                if new_prediction is not None:
-                    self.current_prediction = new_prediction
-                    self.prediction_locked = True
-                    print("[LOCKED] Prediction locked. Press 'R' to reset.")
-            
-            # Check timeout
-            self.trajectory_predictor.check_timeout(current_time)
-        
-        # ===== ROBOT TRACKING =====
-        if self.use_threaded_aruco and self.threaded_tracker:
-            # Submit frame for async processing
-            if self.frame_count % self.robot_track_interval == 0:
-                self.threaded_tracker.update_frame(frame_bgr)
-            # Get latest result (non-blocking)
-            self.current_robot_pose, self.current_detections = self.threaded_tracker.get_pose()
-        else:
-            # Synchronous tracking (every N frames)
-            if self.frame_count % self.robot_track_interval == 0:
-                self.current_robot_pose, self.current_detections = self.robot_tracker.update(frame_bgr)
-        
-        # ===== SEND COMBINED UDP =====
-        ball_landing = None
-        ball_confidence = 0.0
-        
-        if self.current_prediction is not None:
-            ball_landing = self.current_prediction.position
-            ball_confidence = self.current_prediction.confidence
-        
-        self.udp_sender.send_combined_data(
-            ball_landing=ball_landing,
-            ball_confidence=ball_confidence,
-            robot_pose=self.current_robot_pose
-        )
-        
-        # ===== VISUALIZATION (OPTIMIZED) =====
-        # frame_bgr is already a copy from ZED, draw directly on it
-        # No need for additional copy - saves memory bandwidth
-        
-        # Draw ball detection
-        if detection and ball_pos is not None:
-            x, y, radius = detection
-            cv.circle(frame_bgr, (x, y), int(radius), (0, 255, 0), 2)
-            cv.circle(frame_bgr, (x, y), 3, (0, 0, 255), -1)
-        elif detection:
-            x, y, radius = detection
-            cv.circle(frame_bgr, (x, y), int(radius), (0, 165, 255), 2)
-        
-        # Update overlay only every N frames to reduce text rendering overhead
-        if self.frame_count % self.viz_update_interval == 0:
-            self._update_overlay_cache(ball_pos)
-        
-        self._draw_cached_overlay(frame_bgr, detection, ball_pos)
-        
-        return frame_bgr
-    
-    def _update_overlay_cache(self, ball_pos: Optional[np.ndarray]):
-        """Update cached overlay data (called every N frames)"""
-        # Calculate FPS
-        if self.fps_history:
-            fps = sum(self.fps_history) / len(self.fps_history)
-        else:
-            fps = 0.0
-        
-        self._cached_overlay_data = {
-            'fps': fps,
-            'packets': self.udp_sender.packets_sent,
-            'udp_enabled': self.udp_sender.enabled,
-            'ball_pos': ball_pos.copy() if ball_pos is not None else None,
-            'prediction': self.current_prediction,
-            'robot_pose': self.current_robot_pose,
-            'prediction_locked': self.prediction_locked
-        }
-    
-    def _draw_cached_overlay(self, frame: np.ndarray, detection, ball_pos: Optional[np.ndarray]):
-        """Draw overlay using cached data"""
-        h, w = frame.shape[:2]
-        y_pos = 30
-        cache = self._cached_overlay_data
-        
-        if not cache:
-            return
-        
-        # Header
-        cv.putText(frame, "Ball Catcher (Optimized)", (10, y_pos),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        y_pos += 30
-        
-        # FPS
-        fps = cache.get('fps', 0)
-        fps_color = (0, 255, 0) if fps >= 25 else (0, 165, 255) if fps >= 15 else (0, 0, 255)
-        cv.putText(frame, f"FPS: {fps:.1f}", (10, y_pos),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, fps_color, 1)
-        y_pos += 20
-        
-        # UDP Status
-        udp_status = "ON" if cache.get('udp_enabled', False) else "OFF"
-        udp_color = (0, 255, 0) if cache.get('udp_enabled', False) else (0, 0, 255)
-        cv.putText(frame, f"UDP: {udp_status} ({cache.get('packets', 0)})", 
-                  (10, y_pos), cv.FONT_HERSHEY_SIMPLEX, 0.5, udp_color, 1)
-        y_pos += 30
-        
-        # Ball position (use live data for responsiveness)
-        if ball_pos is not None:
-            cv.putText(frame, f"Ball: [{ball_pos[0]:.2f}, {ball_pos[1]:.2f}, {ball_pos[2]:.2f}]", 
-                      (10, y_pos), cv.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
-            y_pos += 22
-        
-        # Landing prediction
-        pred = cache.get('prediction')
-        if pred is not None:
-            landing = pred.position
-            conf = pred.confidence
-            pred_color = (0, 255, 255) if conf >= 0.8 else (0, 200, 255)
-            status = "[LOCKED]" if cache.get('prediction_locked', False) else ""
-            cv.putText(frame, f"Landing{status}: [{landing[0]:.2f}, {landing[2]:.2f}] ({conf*100:.0f}%)", 
-                      (10, y_pos), cv.FONT_HERSHEY_SIMPLEX, 0.45, pred_color, 1)
-            y_pos += 22
-        
-        # Robot pose (bottom left)
-        robot_pose = cache.get('robot_pose')
-        if robot_pose:
-            bottom_y = h - 40
-            cv.putText(frame, f"Robot: [{robot_pose.x:.2f}, {robot_pose.z:.2f}] yaw:{np.degrees(robot_pose.yaw):.0f}",
-                      (10, bottom_y), cv.FONT_HERSHEY_SIMPLEX, 0.45, (255, 128, 0), 1)
-        
-        # Controls hint
-        cv.putText(frame, "[R]Reset [C]Calibrate [U]UDP [D]Debug [Q]Quit",
-                  (10, h - 10), cv.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
-    
-    def reset_trajectory(self):
-        """Reset trajectory prediction"""
-        self.trajectory_predictor.reset()
-        self.current_prediction = None
-        self.prediction_locked = False
-        print("[RESET] Trajectory cleared and unlocked - ready for new throw")
-    
-    def calibrate_robot_origin(self):
-        """Set current robot position as origin"""
-        self.robot_tracker.set_origin()
-        print("[CALIBRATE] Robot origin set")
-    
-    def reset_robot_origin(self):
-        """Reset robot origin calibration"""
-        self.robot_tracker.reset_origin()
-        print("[RESET] Robot origin cleared")
-    
-    def toggle_udp(self):
-        """Toggle UDP sending"""
-        self.udp_sender.toggle()
-    
+            packet = struct.pack('3f', x, y, z)
+            self.sock.sendto(packet, (self.robot_ip, self.port))
+            self.packets_sent += 1
+            return True
+        except Exception as e:
+            print(f"[UDP ERROR] Failed to send predicted landing: {e}")
+            return False
+
+    def toggle(self) -> bool:
+        self.enabled = not self.enabled
+        status = "ENABLED" if self.enabled else "DISABLED"
+        print(f"[UDP] Sending {status}")
+        return self.enabled
+
     def close(self):
-        """Clean up resources"""
-        if self.threaded_tracker:
-            self.threaded_tracker.stop()
-        self.zed.close()
-        self.udp_sender.close()
-        cv.destroyAllWindows()
+        self.sock.close()
 
 
-# ==================== MAIN ====================
+# ===========================
+# BALL DETECTOR
+# ===========================
+
+class HSVBallDetector:
+    def __init__(self):
+        self.kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5))
+
+    def detect(self, frame):
+        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+        mask = cv.inRange(hsv, HSV_LOWER, HSV_UPPER)
+        mask = cv.morphologyEx(mask, cv.MORPH_OPEN, self.kernel)
+        mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, self.kernel)
+
+        contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+        best, best_area = None, 0
+        for c in contours:
+            area = cv.contourArea(c)
+            if not (MIN_AREA < area < MAX_AREA):
+                continue
+
+            peri = cv.arcLength(c, True)
+            if peri == 0:
+                continue
+
+            circ = 4 * np.pi * area / (peri * peri)
+            if circ < MIN_CIRC:
+                continue
+
+            (cx, cy), radius = cv.minEnclosingCircle(c)
+            if radius < 4:
+                continue
+
+            if area > best_area:
+                best_area = area
+                best = ((cx, cy), radius)
+
+        return best
+
+
+# ===========================
+# STEREO MODEL FOR BALL TRIANGULATION
+# ===========================
+
+class StereoModel:
+    def __init__(self, i0, i1, e1):
+        self.K0, _ = load_intrinsics_dat(i0)
+        self.K1, _ = load_intrinsics_dat(i1)
+        self.R1, self.T1 = load_extrinsics_dat(e1)
+
+        # Heuristic: convert T1 to meters (cm or mm)
+        if np.linalg.norm(self.T1) > 1.0:
+            self.T1 /= 100.0  # assume cm -> m
+
+        self.B = abs(self.T1[0, 0])   # baseline in meters
+        self.fx = self.K0[0, 0]
+        self.fy = self.K0[1, 1]
+        self.cx = self.K0[0, 2]
+        self.cy = self.K0[1, 2]
+
+        print("[StereoModel] fx,fy,cx,cy =", self.fx, self.fy, self.cx, self.cy)
+        print("[StereoModel] Baseline B =", self.B)
+
+
+def triangulate_simple(uL, vL, uR, vR, M: StereoModel):
+    d = (uL - uR)
+    if d <= 0.5:
+        return None
+
+    Z = M.fx * M.B / d
+    X = (uL - M.cx) * Z / M.fx
+    Y = -(vL - M.cy) * Z / M.fy
+    return np.array([X, Y, Z], float)
+
+
+# ===========================
+# BALL TRAJECTORY ESTIMATOR
+# ===========================
+
+class BallTrajectoryEstimator:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.t0 = None
+        self.times = []
+        self.pos = []
+
+    def add(self, t_abs, p):
+        if self.t0 is None:
+            self.t0 = t_abs
+        t = t_abs - self.t0
+        self.times.append(t)
+        self.pos.append(p.copy())
+
+        if len(self.times) > MAX_HISTORY:
+            self.times.pop(0)
+            self.pos.pop(0)
+
+    def _fit_ls(self, idx):
+        if len(idx) < 2:
+            return None
+
+        t = np.array([self.times[i] for i in idx])
+        xyz = np.array([self.pos[i] for i in idx])
+
+        A = np.column_stack([np.ones_like(t), t])
+
+        try:
+            X0, Vx = np.linalg.lstsq(A, xyz[:, 0], rcond=None)[0]
+            Y_lin = xyz[:, 1] + 0.5 * G * (t ** 2)
+            Y0, Vy = np.linalg.lstsq(A, Y_lin, rcond=None)[0]
+            Z0, Vz = np.linalg.lstsq(A, xyz[:, 2], rcond=None)[0]
+            return X0, Y0, Z0, Vx, Vy, Vz
+        except:
+            return None
+
+    def _res(self, P):
+        X0, Y0, Z0, Vx, Vy, Vz = P
+        t = np.array(self.times)
+        xyz = np.array(self.pos)
+        Xp = X0 + Vx * t
+        Yp = Y0 + Vy * t - 0.5 * G * t * t
+        Zp = Z0 + Vz * t
+        return np.linalg.norm(np.column_stack([Xp, Yp, Zp]) - xyz, axis=1)
+
+    def estimate(self):
+        n = len(self.times)
+        if n < MIN_SAMPLES:
+            # debug
+            print(f"[ESTIMATE] Not enough samples: n={n} < MIN_SAMPLES={MIN_SAMPLES}")
+            return None, None
+
+        bestP, bestIn, bestCount = None, None, -1
+        idxAll = list(range(n))
+
+        for _ in range(RANSAC_ITERS):
+            subset = random.sample(idxAll, 3)
+            P = self._fit_ls(subset)
+            if P is None:
+                continue
+
+            r = self._res(P)
+            inl = r < RANSAC_INLIER_THRESH
+            c = np.sum(inl)
+            if c > bestCount:
+                bestCount = c
+                bestP = P
+                bestIn = inl
+
+        if bestP is None or bestCount < MIN_SAMPLES:
+            print(f"[ESTIMATE] RANSAC failed or too few inliers: "
+                  f"bestCount={bestCount}, MIN_SAMPLES={MIN_SAMPLES}, n={n}")
+            return None, None
+
+        finalIdx = [i for i, v in enumerate(bestIn) if v]
+        P2 = self._fit_ls(finalIdx)
+        if P2 is None:
+            return bestP, bestIn
+        return P2, bestIn
+
+    def _solve_t_land(self, P):
+        X0, Y0, Z0, Vx, Vy, Vz = P
+        a = -0.5 * G
+        b = Vy
+        c = Y0 - GROUND_Y
+        D = b * b - 4 * a * c
+        if D < 0:
+            print(f"[LAND] Negative discriminant: D={D:.4f}, Y0={Y0:.3f}, Vy={Vy:.3f}")
+            return None
+        r1 = (-b + np.sqrt(D)) / (2 * a)
+        r2 = (-b - np.sqrt(D)) / (2 * a)
+        cand = [t for t in (r1, r2) if t > 0]
+        if not cand:
+            print(f"[LAND] No positive root: r1={r1:.3f}, r2={r2:.3f}")
+            return None
+        return min(cand)
+
+    def landing_point(self):
+        """
+        Returns:
+            landing_pos: np.array([X, Y, Z]) at ground
+            P: trajectory params
+            tL: time-to-land (s, relative to first sample)
+        """
+        n = len(self.times)
+        P, inl = self.estimate()
+        if P is None:
+            # already logged in estimate()
+            return None, None, None
+
+        tL = self._solve_t_land(P)
+        if tL is None:
+            # already logged in _solve_t_land
+            return None, P, None
+
+        X0, Y0, Z0, Vx, Vy, Vz = P
+        land = np.array([X0 + Vx * tL, GROUND_Y, Z0 + Vz * tL])
+        print(f"[LAND] Success: n={n}, land={land}, tL={tL:.3f}")
+        return land, P, tL
+
+
+# ===========================
+# ARUCO ROBOT POSE (SINGLE CAMERA, HEADING YAW)
+# ===========================
+
+class ArucoCamera:
+    def __init__(self, K: np.ndarray, D: np.ndarray):
+        self.intrinsic = K
+        self.distortion = D.reshape(-1, 1).astype(np.float64)
+
+
+def create_aruco_detectors() -> Dict[str, cv.aruco.ArucoDetector]:
+    detectors = {}
+    dict_types = {
+        'left':  cv.aruco.DICT_4X4_50,
+        'front': cv.aruco.DICT_5X5_50,
+        'right': cv.aruco.DICT_6X6_50,
+        'back':  cv.aruco.DICT_7X7_50
+    }
+    for side_name, dict_type in dict_types.items():
+        dictionary = cv.aruco.getPredefinedDictionary(dict_type)
+        params = cv.aruco.DetectorParameters()
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 23
+        params.adaptiveThreshWinSizeStep = 10
+        params.cornerRefinementMethod = cv.aruco.CORNER_REFINE_SUBPIX
+        detectors[side_name] = cv.aruco.ArucoDetector(dictionary, params)
+    return detectors
+
+
+def detect_aruco_corners(
+    frame: np.ndarray,
+    detectors: Dict[str, cv.aruco.ArucoDetector]
+) -> Dict[str, np.ndarray]:
+    gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    detected = {}
+    for side_name, detector in detectors.items():
+        corners, ids, _ = detector.detectMarkers(gray)
+        if ids is not None:
+            for i, marker_id in enumerate(ids.flatten()):
+                if marker_id == 0:
+                    detected[side_name] = corners[i].reshape(4, 2)
+                    break
+    return detected
+
+
+def get_marker_model_points(marker_size: float) -> np.ndarray:
+    half = marker_size / 2.0
+    return np.array([
+        [-half,  half, 0.0],  # top-left
+        [ half,  half, 0.0],  # top-right
+        [ half, -half, 0.0],  # bottom-right
+        [-half, -half, 0.0],  # bottom-left
+    ], dtype=np.float64)
+
+
+def heading_yaw_from_marker(side_name: str, R_cam: np.ndarray) -> float:
+    # marker normal in camera frame (OpenCV: +X right, +Y down, +Z forward)
+    n_cam = R_cam[:, 2].astype(np.float64)
+    n_norm = np.linalg.norm(n_cam)
+    if n_norm < 1e-8:
+        return 0.0
+    n_cam /= n_norm
+
+    if side_name == 'back':
+        H_cam = -n_cam
+    elif side_name == 'front':
+        H_cam = n_cam
+    elif side_name == 'right':
+        H_cam = np.array([-n_cam[2], n_cam[1], n_cam[0]])   # R_y(-90°)*n
+    elif side_name == 'left':
+        H_cam = np.array([n_cam[2], n_cam[1], -n_cam[0]])   # R_y(+90°)*n
+    else:
+        H_cam = -n_cam
+
+    H_xz = np.array([H_cam[0], H_cam[2]], dtype=np.float64)
+    h_norm = np.linalg.norm(H_xz)
+    if h_norm < 1e-8:
+        return 0.0
+    H_xz /= h_norm
+
+    yaw_rad = np.arctan2(H_xz[0], H_xz[1])  # atan2(X, Z)
+    return float(np.degrees(yaw_rad))
+
+
+def pose_from_aruco_pnp(
+    side_name: str,
+    corners_px: np.ndarray,
+    camera: ArucoCamera,
+    marker_size_m: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    corners_input = corners_px.reshape(1, 1, 4, 2).astype(np.float32)
+
+    rvecs, tvecs, _ = cv.aruco.estimatePoseSingleMarkers(
+        corners_input,
+        marker_size_m,
+        camera.intrinsic,
+        camera.distortion
+    )
+
+    rvec = rvecs[0, 0, :]
+    tvec = tvecs[0, 0, :]
+
+    R_cam, _ = cv.Rodrigues(rvec)
+    t_cam = tvec.reshape(3, 1)
+
+    yaw_deg = heading_yaw_from_marker(side_name, R_cam)
+
+    # camera OpenCV (+Y down) -> USER (+Y up)
+    S = np.diag([1.0, -1.0, 1.0])
+    R_user = S @ R_cam
+    t_user = S @ t_cam
+
+    obj_pts = get_marker_model_points(marker_size_m)
+    corners_3d_user = []
+    for p in obj_pts:
+        p_cam = R_user @ p.reshape(3, 1) + t_user
+        corners_3d_user.append(p_cam.ravel())
+    corners_3d_user = np.array(corners_3d_user)
+
+    return R_user, t_user.ravel(), corners_3d_user, yaw_deg
+
+
+class DetectedMarker:
+    def __init__(self, side_name, corners_left, corners_right,
+                 corners_3d, position, yaw_angle, rotation_matrix):
+        self.side_name = side_name
+        self.corners_left = corners_left
+        self.corners_right = corners_right
+        self.corners_3d = corners_3d
+        self.position = position
+        self.yaw_angle = yaw_angle
+        self.rotation_matrix = rotation_matrix
+
+
+def process_aruco_frame(
+    left_frame: np.ndarray,
+    right_frame: np.ndarray,
+    detectors: Dict[str, cv.aruco.ArucoDetector],
+    camera: ArucoCamera,
+    marker_size_m: float
+) -> List[DetectedMarker]:
+    corners_left = detect_aruco_corners(left_frame, detectors)
+    corners_right = detect_aruco_corners(right_frame, detectors)
+
+    markers: List[DetectedMarker] = []
+    for side_name, pts_left in corners_left.items():
+        R_user, t_user, corners_3d_user, yaw_deg = pose_from_aruco_pnp(
+            side_name,
+            pts_left,
+            camera,
+            marker_size_m
+        )
+        position = t_user
+        pts_right = corners_right.get(side_name, np.zeros((4, 2)))
+        markers.append(DetectedMarker(
+            side_name, pts_left, pts_right,
+            corners_3d_user, position, yaw_deg, R_user
+        ))
+    return markers
+
+
+def compute_robot_pose(
+    markers: List[DetectedMarker]
+) -> Optional[Tuple[np.ndarray, float, List[DetectedMarker]]]:
+    if not markers:
+        return None
+
+    positions = np.array([m.position for m in markers])
+    avg_position = np.mean(positions, axis=0)
+
+    priority = {'back': 0, 'front': 1, 'left': 2, 'right': 3}
+    best = min(markers, key=lambda m: priority.get(m.side_name, 99))
+    yaw = best.yaw_angle
+
+    return avg_position, yaw, markers
+
+
+# ===========================
+# MAIN UNIFIED LOOP
+# ===========================
 
 def main():
-    parser = argparse.ArgumentParser(description='Ball Catcher Integration System (Optimized)')
-    
-    # Robot tracking args
-    parser.add_argument('--marker-size', type=float, required=True,
-                       help='ArUco marker size in mm')
-    parser.add_argument('--left-id', type=int, default=0,
-                       help='Marker ID for left side (4x4 dict)')
-    parser.add_argument('--front-id', type=int, default=0,
-                       help='Marker ID for front side (5x5 dict)')
-    parser.add_argument('--right-id', type=int, default=0,
-                       help='Marker ID for right side (6x6 dict)')
-    parser.add_argument('--back-id', type=int, default=0,
-                       help='Marker ID for back side (7x7 dict)')
-    
-    # UDP args
-    parser.add_argument('--robot-ip', type=str, default=DEFAULT_ROBOT_IP,
-                       help='Robot IP address')
-    parser.add_argument('--robot-port', type=int, default=DEFAULT_ROBOT_PORT,
-                       help='Robot UDP port')
-    parser.add_argument('--no-udp', action='store_true',
-                       help='Disable UDP sending')
-    
-    # Performance args
-    parser.add_argument('--fast-depth', action='store_true',
-                       help='Use PERFORMANCE depth mode (faster but less accurate)')
-    parser.add_argument('--detection-scale', type=float, default=0.5,
-                       help='Ball detection scale factor (0.5 = half res, default: 0.5)')
-    parser.add_argument('--robot-interval', type=int, default=4,
-                       help='Robot tracking interval (frames, default: 4)')
-    parser.add_argument('--threaded-aruco', action='store_true',
-                       help='Use threaded ArUco detection')
-    
-    # Display args
-    parser.add_argument('--debug', action='store_true',
-                       help='Enable debug visualization')
-    
-    args = parser.parse_args()
-    
-    print("=" * 60)
-    print("  BALL CATCHER INTEGRATION SYSTEM (OPTIMIZED)")
-    print("=" * 60)
-    print(f"\nPerformance settings:")
-    print(f"  - Detection scale: {args.detection_scale}")
-    print(f"  - Fast depth: {args.fast_depth}")
-    print(f"  - Robot tracking interval: every {args.robot_interval} frames")
-    print(f"  - Threaded ArUco: {args.threaded_aruco}")
-    
-    # Initialize system
-    system = BallCatcherSystem(
-        marker_size_mm=args.marker_size,
-        left_id=args.left_id,
-        front_id=args.front_id,
-        right_id=args.right_id,
-        back_id=args.back_id,
-        robot_ip=args.robot_ip,
-        robot_port=args.robot_port,
-        enable_udp=not args.no_udp,
-        debug=args.debug,
-        fast_depth=args.fast_depth,
-        detection_scale=args.detection_scale,
-        robot_track_interval=args.robot_interval,
-        use_threaded_aruco=args.threaded_aruco
-    )
-    
-    print("\n" + "=" * 60)
-    print("Starting optimized tracking...")
-    print("Controls:")
-    print("  [R] Reset trajectory prediction")
-    print("  [C] Calibrate robot origin")
-    print("  [U] Toggle UDP sending")
-    print("  [D] Toggle debug visualization")
-    print("  [Q/ESC] Quit")
-    print("=" * 60 + "\n")
-    
+    # Enable OpenCV optimizations (multi-threaded C++)
+    cv.setUseOptimized(True)
     try:
-        while True:
-            # Process frame
-            frame = system.process_frame()
-            
-            if frame is not None:
-                cv.imshow("Ball Catcher System", frame)
-            
-            # Handle keyboard input (non-blocking)
-            key = cv.waitKey(1) & 0xFF
-            
-            if key == ord('q') or key == 27:  # Q or ESC
-                break
-            elif key == ord('r'):
-                system.reset_trajectory()
-            elif key == ord('c'):
-                system.calibrate_robot_origin()
-            elif key == ord('u'):
-                system.toggle_udp()
-            elif key == ord('d'):
-                system.debug = not system.debug
-                print(f"[DEBUG] Debug visualization: {'ON' if system.debug else 'OFF'}")
-    
-    except KeyboardInterrupt:
-        print("\n\nInterrupted by user")
-    
-    finally:
-        # Calculate final stats
-        elapsed = time.time() - system.start_time
-        avg_fps = system.frame_count / elapsed if elapsed > 0 else 0
-        
-        print("\n" + "=" * 60)
-        print(f"✓ Total frames: {system.frame_count}")
-        print(f"✓ Average FPS: {avg_fps:.1f}")
-        print(f"✓ UDP packets sent: {system.udp_sender.packets_sent}")
-        print("✓ Ball catcher system stopped")
-        print("=" * 60)
-        
-        system.close()
+        cv.setNumThreads(cv.getNumberOfCPUs())
+    except Exception:
+        pass
+
+    # -------------
+    # Init modules
+    # -------------
+    detector = HSVBallDetector()
+    stereo_model = StereoModel(INTR0_PATH, INTR1_PATH, EXTR1_PATH)
+    traj_est = BallTrajectoryEstimator()
+
+    # intrinsics for ArUco camera 0
+    K0, D0 = load_intrinsics_dat(INTR0_PATH)
+    aruco_cam = ArucoCamera(K0, D0)
+    detectors = create_aruco_detectors()
+    marker_size_m = 0.095  # 95 mm
+
+    # UDP
+    udp = UDPSender(robot_ip=DEFAULT_ROBOT_IP,
+                    port=DEFAULT_ROBOT_PORT,
+                    rate_limit=UDP_RATE_LIMIT_HZ)
+
+    # -------------
+    # Init ZED
+    # -------------
+    zed = sl.Camera()
+    ip = sl.InitParameters()
+    ip.camera_resolution = sl.RESOLUTION.HD720
+    ip.camera_fps = 30
+    ip.depth_mode = sl.DEPTH_MODE.NONE
+    ip.coordinate_units = sl.UNIT.METER
+    if zed.open(ip) != sl.ERROR_CODE.SUCCESS:
+        print("ZED open FAILED.")
+        return
+
+    left_mat = sl.Mat()
+    right_mat = sl.Mat()
+
+    # -------------
+    # Ball tracker state
+    # -------------
+    last_smooth = None
+    state = "IDLE"
+    locked = None
+    locked_tL = None
+
+    vel_buffer = deque(maxlen=VEL_WIN)
+    last_raw = None
+    last_time = None
+
+    throw_verify = 0
+    prediction_done = False
+    landing_udp_sent = False
+
+    frame_count = 0
+    last_loop_time = None
+    fps = 0.0
+
+    # Robot pose cache for subsampling ArUco
+    aruco_frame_counter = 0
+    last_robot_pose = None
+    last_markers = []
+
+    print("\nControls: 'q'/ESC=Quit, 'r'=Reset ball, 'u'=UDP toggle\n")
+
+    while True:
+        # -------- FPS measurement --------
+        now_loop = time.time()
+        if last_loop_time is not None:
+            dt_loop = now_loop - last_loop_time
+            if dt_loop > 0:
+                fps = 1.0 / dt_loop
+        last_loop_time = now_loop
+
+        if zed.grab() != sl.ERROR_CODE.SUCCESS:
+            continue
+
+        zed.retrieve_image(left_mat, sl.VIEW.LEFT)
+        zed.retrieve_image(right_mat, sl.VIEW.RIGHT)
+
+        frameL = np.ascontiguousarray(left_mat.get_data()[:, :, :3])
+        frameR = np.ascontiguousarray(right_mat.get_data()[:, :, :3])
+
+        # ====================================================
+        # BALL TRACKING + TRAJECTORY
+        # ====================================================
+        detL = detector.detect(frameL)
+        detR = detector.detect(frameR) if detL else None
+
+        speed = 0.0
+        vy = 0.0
+        throw_cond = False
+
+        if detL and detR:
+            (uL, vL), rL = detL
+            (uR, vR), rR = detR
+            raw = triangulate_simple(uL, vL, uR, vR, stereo_model)
+            if raw is not None:
+                if last_smooth is None:
+                    smooth = raw
+                else:
+                    smooth = SMOOTH_ALPHA * raw + (1 - SMOOTH_ALPHA) * last_smooth
+                last_smooth = smooth
+
+                now = now_loop
+
+                if last_raw is not None and last_time is not None:
+                    dt = now - last_time
+                    if dt > 0:
+                        v = (raw - last_raw) / dt
+                        vel_buffer.append(v)
+
+                last_raw = raw
+                last_time = now
+
+                v_est = np.mean(vel_buffer, axis=0) if len(vel_buffer) > 0 else np.zeros(3)
+                speed = float(np.linalg.norm(v_est))
+                vy = float(v_est[1])
+
+                # ---------------------------
+                #   STATE MACHINE
+                # ---------------------------
+                if state == "IDLE":
+                    state = "HOLD"
+                    throw_verify = 0
+
+                elif state == "HOLD":
+                    traj_est.reset()
+                    if not prediction_done:
+                        locked = None
+                        locked_tL = None
+                        landing_udp_sent = False
+
+                        throw_cond = (speed > THROW_SPEED_THRESH and
+                                      vy > abs(THROW_UPWARD_VY_THRESH))
+                        if throw_cond:
+                            throw_verify += 1
+                        else:
+                            throw_verify = 0
+
+                        if throw_verify >= THROW_VERIFY_FRAMES:
+                            print(f"[THROW DETECTED] speed={speed:.2f}, vy={vy:.2f}, fps={fps:.1f}")
+                            state = "THROWN"
+                            vel_buffer.clear()
+                            traj_est.reset()
+                            traj_est.add(now, smooth)
+                            throw_verify = 0
+
+                elif state == "THROWN":
+                    if not prediction_done:
+                        traj_est.add(now_loop, smooth)
+                        # debug
+                        # print(f"[THROWN] samples={len(traj_est.times)}")
+                        if locked is None:
+                            land, P, tL = traj_est.landing_point()
+                            if land is not None and tL is not None:
+                                locked = land
+                                locked_tL = tL
+                                prediction_done = True
+                                state = "LOCKED_STATE"
+                                print(f"[LOCKED] Landing = {land}, tL={tL:.3f} s")
+
+                                if not landing_udp_sent:
+                                    landing_udp_sent = True
+
+                elif state == "LOCKED_STATE":
+                    pass
+
+                # draw ball debug
+                Xb, Yb, Zb = smooth
+                cv.circle(frameL, (int(uL), int(vL)), int(rL), (0, 255, 0), 2)
+                cv.putText(frameL, f"BALL X={Xb:.2f} Y={Yb:.2f} Z={Zb:.2f}",
+                           (20, 40), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv.putText(frameL, f"speed={speed:.2f} vy={vy:.2f} STATE={state}",
+                           (20, 70), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv.putText(frameL,
+                           f"throw_cond={throw_cond} verify={throw_verify}/{THROW_VERIFY_FRAMES}",
+                           (20, 100), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+                if locked is not None:
+                    LX, LY, LZ = locked
+                    tL_txt = f"{locked_tL:.2f}" if locked_tL is not None else "?"
+                    cv.putText(frameL, f"LAND LOCK X={LX:.2f} Z={LZ:.2f} t={tL_txt}s",
+                               (20, 130), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+            else:
+                cv.putText(frameL, "BAD TRIANG", (20, 40),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        else:
+            if not prediction_done:
+                state = "IDLE"
+                traj_est.reset()
+                vel_buffer.clear()
+                last_smooth = None
+                last_raw = None
+                locked = None
+                locked_tL = None
+                throw_verify = 0
+                landing_udp_sent = False
+
+            cv.putText(frameL, "BALL SEARCHING...", (20, 40),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if locked is not None and prediction_done:
+                LX, LY, LZ = locked
+                tL_txt = f"{locked_tL:.2f}" if locked_tL is not None else "?"
+                cv.putText(frameL, f"LAND LOCK X={LX:.2f} Z={LZ:.2f} t={tL_txt}s",
+                           (20, 70), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+        # ====================================================
+        # ROBOT POSE VIA ARUCO (subsampled, but skip while THROWN)
+        # ====================================================
+        # While ball is in flight and prediction not done, skip ArUco to keep FPS high
+        if not (state == "THROWN" and not prediction_done):
+            aruco_frame_counter += 1
+            if aruco_frame_counter % ARUCO_UPDATE_EVERY == 0:
+                markers = process_aruco_frame(frameL, frameR, detectors, aruco_cam, marker_size_m)
+                last_markers = markers
+                if markers:
+                    last_robot_pose = compute_robot_pose(markers)
+
+        markers = last_markers
+        robot_pose = last_robot_pose
+
+        robot_pose_text = "Robot: NO MARKER"
+        if robot_pose is not None:
+            pos, yaw_deg, det_list = robot_pose
+            rx, ry, rz = pos
+            dist = float(np.sqrt(rx*rx + rz*rz))
+            robot_pose_text = (f"Robot X={rx:+.2f} Y={ry:+.2f} Z={rz:+.2f} "
+                               f"dist={dist:.2f} yaw={yaw_deg:+.1f}")
+
+            colors = {
+                'left':  (255, 0, 0),
+                'front': (0, 255, 0),
+                'right': (0, 0, 255),
+                'back':  (255, 255, 0)
+            }
+            for m in det_list:
+                color = colors.get(m.side_name, (255, 255, 255))
+                cL = m.corners_left.astype(int)
+                for i in range(4):
+                    cv.line(frameL, tuple(cL[i]), tuple(cL[(i+1) % 4]), color, 2)
+                center_l = cL.mean(axis=0).astype(int)
+                cv.putText(frameL, m.side_name.upper(),
+                           (center_l[0]-20, center_l[1]-10),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+            udp.send_robot_pose(float(rx), float(ry), float(rz), float(yaw_deg))
+
+        cv.putText(frameL, robot_pose_text, (20, 170),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv.putText(frameL,
+                   f"UDP {'ON' if udp.enabled else 'OFF'} sent={udp.packets_sent}",
+                   (20, 200),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+
+        # Send predicted landing coordinates (0,0,0 until locked)
+        if locked is not None:
+            udp.send_predicted_landing(float(locked[0]), float(locked[1]), float(locked[2]))
+        else:
+            udp.send_predicted_landing(0.0, 0.0, 0.0)
+
+        cv.putText(frameL, f"FPS={fps:4.1f}", (20, 230),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        cv.imshow("UnifiedView", frameL)
+        key = cv.waitKey(1) & 0xFF
+
+        if key == 27 or key == ord('q'):
+            break
+        elif key == ord('r'):
+            traj_est.reset()
+            locked = None
+            locked_tL = None
+            prediction_done = False
+            vel_buffer.clear()
+            state = "HOLD"
+            throw_verify = 0
+            last_smooth = None
+            last_raw = None
+            last_time = None
+            landing_udp_sent = False
+            print("[RESET BALL]")
+        elif key == ord('u'):
+            udp.toggle()
+
+        frame_count += 1
+
+    udp.close()
+    zed.close()
+    cv.destroyAllWindows()
 
 
 if __name__ == "__main__":
