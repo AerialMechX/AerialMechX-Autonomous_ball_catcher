@@ -4,9 +4,14 @@ Dual-Camera Robot Pose Estimator (Optimized)
 Camera 0 (origin): 341522302002
 Camera 1 (secondary): 213522253879
 
+Optimizations:
+- Threaded Camera 1 frame capture
+- Alternate-frame Camera 1 detection
+- Reduced frame copies
+
 Markers: 4x4=LEFT, 5x5=FRONT, 6x6=RIGHT, 7x7=BACK (ID=0, 95mm)
 
-Run: python dual_robot_pose_estimator.py
+Run: python robot_tracker.py
 Keys: q=quit, r=reset
 """
 
@@ -16,6 +21,7 @@ import cv2
 from cv2 import aruco
 from collections import deque
 import time
+import threading
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
 
@@ -40,6 +46,9 @@ MARKER_TO_CENTER = {'LEFT': 0.15, 'FRONT': 0.15, 'RIGHT': 0.15, 'BACK': 0.15}
 SIDE_COLORS = {'LEFT': (255,0,0), 'FRONT': (0,255,0), 'RIGHT': (0,0,255), 'BACK': (0,255,255)}
 
 CALIB_DIR = "../calib_output"
+
+# Optimization settings
+SKIP_CAM1_FRAMES = 2  # Detect on Cam1 every N frames (1 = every frame)
 # =========================================================
 
 
@@ -162,6 +171,37 @@ class ArUcoDetector:
         return dets
 
 
+class ThreadedCamera:
+    """Background thread for Camera 1 frame capture."""
+    
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self.color = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+    
+    def _capture_loop(self):
+        while self.running:
+            try:
+                frames = self.pipeline.wait_for_frames(timeout_ms=50)
+                color = frames.get_color_frame()
+                if color:
+                    with self.lock:
+                        self.color = np.asanyarray(color.get_data())
+            except:
+                pass
+    
+    def get_frame(self):
+        with self.lock:
+            return self.color
+    
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+
+
 class DualCamSystem:
     def __init__(self, calib):
         self.calib = calib
@@ -171,22 +211,30 @@ class DualCamSystem:
         if CAMERA0_SERIAL not in devs or CAMERA1_SERIAL not in devs:
             raise RuntimeError(f"Cameras not found. Need {CAMERA0_SERIAL} and {CAMERA1_SERIAL}")
         
-        self.pipes = []
         self.Ks = [calib.K0, calib.K1]
         self.dists = [calib.dist0, calib.dist1]
         
-        for i, ser in enumerate([CAMERA0_SERIAL, CAMERA1_SERIAL]):
-            p = rs.pipeline()
-            cfg = rs.config()
-            cfg.enable_device(ser)
-            cfg.enable_stream(rs.stream.color, RESOLUTION[0], RESOLUTION[1], rs.format.bgr8, FPS)
-            p.start(cfg)
-            self.pipes.append(p)
-            print(f"Cam{i} ({ser}) started")
+        # Camera 0 - main pipeline (blocking)
+        self.pipe0 = rs.pipeline()
+        cfg0 = rs.config()
+        cfg0.enable_device(CAMERA0_SERIAL)
+        cfg0.enable_stream(rs.stream.color, RESOLUTION[0], RESOLUTION[1], rs.format.bgr8, FPS)
+        self.pipe0.start(cfg0)
+        print(f"Cam0 ({CAMERA0_SERIAL}) started")
+        
+        # Camera 1 - threaded pipeline (non-blocking)
+        pipe1 = rs.pipeline()
+        cfg1 = rs.config()
+        cfg1.enable_device(CAMERA1_SERIAL)
+        cfg1.enable_stream(rs.stream.color, RESOLUTION[0], RESOLUTION[1], rs.format.bgr8, FPS)
+        pipe1.start(cfg1)
+        print(f"Cam1 ({CAMERA1_SERIAL}) started (threaded)")
+        
+        self.cam1_thread = ThreadedCamera(pipe1)
     
-    def get_frame(self, cam):
+    def get_frame_cam0(self):
         try:
-            fr = self.pipes[cam].wait_for_frames(timeout_ms=30)
+            fr = self.pipe0.wait_for_frames(timeout_ms=50)
             c = fr.get_color_frame()
             if c:
                 return np.asanyarray(c.get_data())
@@ -194,9 +242,12 @@ class DualCamSystem:
             pass
         return None
     
+    def get_frame_cam1(self):
+        return self.cam1_thread.get_frame()
+    
     def stop(self):
-        for p in self.pipes:
-            p.stop()
+        self.cam1_thread.stop()
+        self.pipe0.stop()
 
 
 class PoseEstimator:
@@ -267,6 +318,7 @@ class PoseEstimator:
 
 
 def draw(img, dets, pose, K, dist, baseline, fps):
+    # Draw directly on img (no copy needed)
     h, w = img.shape[:2]
     
     for d in dets:
@@ -309,34 +361,50 @@ def main():
     detector = ArUcoDetector()
     estimator = PoseEstimator(calib)
     
-    fps_q = deque(maxlen=20)
+    fps_q = deque(maxlen=30)
+    
+    # Optimization state
+    frame_count = 0
+    last_det1 = []
     
     print(f"\nDUAL-CAM ROBOT POSE | Baseline:{calib.baseline*100:.1f}cm")
+    print(f"Cam1 skip: {SKIP_CAM1_FRAMES}")
     print("q=quit r=reset\n")
     
     try:
         while True:
             t0 = time.time()
+            frame_count += 1
             
-            f0 = cams.get_frame(0)
-            f1 = cams.get_frame(1)
-            
+            # Camera 0: blocking wait
+            f0 = cams.get_frame_cam0()
             if f0 is None:
                 continue
             
+            # Camera 1: non-blocking (threaded)
+            f1 = cams.get_frame_cam1()
+            
+            # Always detect on Camera 0
             det0 = detector.detect(f0, cams.Ks[0], cams.dists[0], 0)
-            det1 = detector.detect(f1, cams.Ks[1], cams.dists[1], 1) if f1 is not None else []
+            
+            # Detect on Camera 1 every N frames (use cached otherwise)
+            if f1 is not None and frame_count % SKIP_CAM1_FRAMES == 0:
+                det1 = detector.detect(f1, cams.Ks[1], cams.dists[1], 1)
+                last_det1 = det1
+            else:
+                det1 = last_det1
             
             pose = estimator.estimate(det0, det1)
             
             fps_q.append(time.time() - t0)
             fps = 1.0 / (sum(fps_q) / len(fps_q))
             
-            frame = draw(f0.copy(), det0, pose, cams.Ks[0], cams.dists[0], calib.baseline, fps)
-            cv2.putText(frame, f"C1:{len(det1)}m", (frame.shape[1]-60, 20),
+            # Draw directly on f0 (no copy)
+            draw(f0, det0, pose, cams.Ks[0], cams.dists[0], calib.baseline, fps)
+            cv2.putText(f0, f"C1:{len(det1)}m", (f0.shape[1]-60, 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0) if det1 else (100,100,100), 1)
             
-            cv2.imshow("Robot Pose", frame)
+            cv2.imshow("Robot Pose", f0)
             
             if pose:
                 print(f"\rX:{pose.x:+.3f} Z:{pose.z:+.3f} YAW:{pose.yaw:+6.1f}° [{','.join(pose.sides)}]  ", end="")
@@ -346,6 +414,7 @@ def main():
                 break
             elif k == ord('r'):
                 estimator.reset()
+                last_det1 = []
                 print("\n[RESET]")
     finally:
         cams.stop()
@@ -359,3 +428,4 @@ if __name__ == "__main__":
     
     print("Initializing (this may take a few seconds)...")
     main()
+

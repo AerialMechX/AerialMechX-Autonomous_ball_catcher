@@ -4,7 +4,13 @@ Dual-Camera Trajectory Predictor (Optimized)
 Camera 0 (origin): 341522302002
 Camera 1 (secondary): 213522253879
 
-Run: python dual_trajectory_predictor.py
+Optimizations:
+- GPU inference for YOLO (CUDA)
+- Threaded Camera 1 frame capture
+- Alternate-frame Camera 1 detection
+- Reduced frame copies
+
+Run: python yolo_trajectory_predictor.py
 Keys: q=quit, r=reset
 """
 
@@ -14,6 +20,7 @@ import cv2
 from ultralytics import YOLO
 from collections import deque
 import time
+import threading
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
@@ -39,6 +46,10 @@ MIN_CONF_LOCK = 0.5
 
 CALIB_DIR = "../calib_output"
 MAX_FUSION_DIST = 0.3
+
+# Optimization settings
+USE_GPU = True  # Set to False to force CPU
+SKIP_CAM1_FRAMES = 2  # Detect on Cam1 every N frames (1 = every frame)
 # =========================================================
 
 
@@ -224,6 +235,16 @@ class BallDetector:
     def __init__(self):
         print("Loading YOLO...")
         self.model = YOLO(YOLO_MODEL)
+        
+        # Enable GPU if available
+        if USE_GPU:
+            try:
+                self.model.to("cuda")
+                print("YOLO using CUDA GPU")
+            except Exception as e:
+                print(f"GPU unavailable, using CPU: {e}")
+        
+        # Warmup inference
         self.model.predict(np.zeros((320, 320, 3), dtype=np.uint8), verbose=False)
         print("Ready!")
     
@@ -255,6 +276,42 @@ class BallDetector:
         return None
 
 
+class ThreadedCamera:
+    """Background thread for Camera 1 frame capture."""
+    
+    def __init__(self, pipeline, spatial_filter, depth_scale):
+        self.pipeline = pipeline
+        self.spatial = spatial_filter
+        self.depth_scale = depth_scale
+        self.color = None
+        self.depth = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+    
+    def _capture_loop(self):
+        while self.running:
+            try:
+                frames = self.pipeline.wait_for_frames(timeout_ms=50)
+                color = frames.get_color_frame()
+                depth = self.spatial.process(frames.get_depth_frame())
+                if color and depth:
+                    with self.lock:
+                        self.color = np.asanyarray(color.get_data())
+                        self.depth = np.asanyarray(depth.get_data())
+            except:
+                pass
+    
+    def get_frames(self):
+        with self.lock:
+            return self.color, self.depth
+    
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+
+
 class DualCamSystem:
     def __init__(self, calib):
         self.calib = calib
@@ -264,26 +321,37 @@ class DualCamSystem:
         if CAMERA0_SERIAL not in devs or CAMERA1_SERIAL not in devs:
             raise RuntimeError("Cameras not found")
         
-        self.pipes = []
         self.intrin = []
         self.scales = []
         self.spatial = rs.spatial_filter()
         
-        for i, ser in enumerate([CAMERA0_SERIAL, CAMERA1_SERIAL]):
-            p = rs.pipeline()
-            cfg = rs.config()
-            cfg.enable_device(ser)
-            cfg.enable_stream(rs.stream.color, RESOLUTION[0], RESOLUTION[1], rs.format.bgr8, FPS)
-            cfg.enable_stream(rs.stream.depth, RESOLUTION[0], RESOLUTION[1], rs.format.z16, FPS)
-            prof = p.start(cfg)
-            self.scales.append(prof.get_device().first_depth_sensor().get_depth_scale())
-            self.intrin.append(prof.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics())
-            self.pipes.append(p)
-            print(f"Cam{i} ({ser}) started")
+        # Camera 0 - main pipeline (blocking)
+        self.pipe0 = rs.pipeline()
+        cfg0 = rs.config()
+        cfg0.enable_device(CAMERA0_SERIAL)
+        cfg0.enable_stream(rs.stream.color, RESOLUTION[0], RESOLUTION[1], rs.format.bgr8, FPS)
+        cfg0.enable_stream(rs.stream.depth, RESOLUTION[0], RESOLUTION[1], rs.format.z16, FPS)
+        prof0 = self.pipe0.start(cfg0)
+        self.scales.append(prof0.get_device().first_depth_sensor().get_depth_scale())
+        self.intrin.append(prof0.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics())
+        print(f"Cam0 ({CAMERA0_SERIAL}) started")
+        
+        # Camera 1 - threaded pipeline (non-blocking)
+        pipe1 = rs.pipeline()
+        cfg1 = rs.config()
+        cfg1.enable_device(CAMERA1_SERIAL)
+        cfg1.enable_stream(rs.stream.color, RESOLUTION[0], RESOLUTION[1], rs.format.bgr8, FPS)
+        cfg1.enable_stream(rs.stream.depth, RESOLUTION[0], RESOLUTION[1], rs.format.z16, FPS)
+        prof1 = pipe1.start(cfg1)
+        self.scales.append(prof1.get_device().first_depth_sensor().get_depth_scale())
+        self.intrin.append(prof1.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics())
+        print(f"Cam1 ({CAMERA1_SERIAL}) started (threaded)")
+        
+        self.cam1_thread = ThreadedCamera(pipe1, self.spatial, self.scales[1])
     
-    def get_frames(self, cam):
+    def get_frames_cam0(self):
         try:
-            fr = self.pipes[cam].wait_for_frames(timeout_ms=30)
+            fr = self.pipe0.wait_for_frames(timeout_ms=50)
             c, d = fr.get_color_frame(), self.spatial.process(fr.get_depth_frame())
             if c and d:
                 return np.asanyarray(c.get_data()), np.asanyarray(d.get_data())
@@ -291,9 +359,15 @@ class DualCamSystem:
             pass
         return None, None
     
+    def get_frames_cam1(self):
+        return self.cam1_thread.get_frames()
+    
     def pix_to_3d(self, u, v, dep, cam):
         h, w = dep.shape
-        roi = dep[max(0,int(v)-5):min(h,int(v)+5), max(0,int(u)-5):min(w,int(u)+5)]
+        v_int, u_int = int(v), int(u)
+        y1, y2 = max(0, v_int - 5), min(h, v_int + 5)
+        x1, x2 = max(0, u_int - 5), min(w, u_int + 5)
+        roi = dep[y1:y2, x1:x2]
         roi_m = roi.astype(np.float32) * self.scales[cam]
         valid = roi_m[(roi_m > MIN_DEPTH) & (roi_m < MAX_DEPTH)]
         if len(valid) == 0:
@@ -301,8 +375,8 @@ class DualCamSystem:
         return np.array(rs.rs2_deproject_pixel_to_point(self.intrin[cam], [u, v], np.median(valid)))
     
     def stop(self):
-        for p in self.pipes:
-            p.stop()
+        self.cam1_thread.stop()
+        self.pipe0.stop()
 
 
 class Visualizer:
@@ -319,20 +393,20 @@ class Visualizer:
         return None
     
     def draw(self, frame, det0, det1, pred, fused, fps):
-        img = frame.copy()
-        h, w = img.shape[:2]
+        # Draw directly on frame (no copy needed)
+        h, w = frame.shape[:2]
         
         if det0:
-            cv2.circle(img, (int(det0.center[0]), int(det0.center[1])), int(det0.radius),
+            cv2.circle(frame, (int(det0.center[0]), int(det0.center[1])), int(det0.radius),
                       (0,255,0) if det0.method=='YOLO' else (255,255,0), 2)
         
-        cv2.putText(img, f"C1:{'Y' if det1 else 'N'}", (w-50,20),
+        cv2.putText(frame, f"C1:{'Y' if det1 else 'N'}", (w-50,20),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0) if det1 else (100,100,100), 1)
         
         if pred.kf.init:
             p, v = pred.kf.pos(), pred.kf.vel()
             lbl = "F" if det0 and det1 else "0" if det0 else "1"
-            cv2.putText(img, f"[{lbl}] ({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})m v={np.linalg.norm(v):.1f}m/s",
+            cv2.putText(frame, f"[{lbl}] ({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})m v={np.linalg.norm(v):.1f}m/s",
                        (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,255,255), 2)
         
         land = pred.get_land()
@@ -343,37 +417,37 @@ class Visualizer:
                 pts2d = [p for p in pts2d if p]
                 for i in range(1, len(pts2d)):
                     prog = i / len(pts2d)
-                    cv2.line(img, pts2d[i-1], pts2d[i], (0, int(255*(1-prog)), int(255*prog)), 2)
+                    cv2.line(frame, pts2d[i-1], pts2d[i], (0, int(255*(1-prog)), int(255*prog)), 2)
             
             lp = self.proj(land.pos)
             if lp:
-                cv2.circle(img, lp, 15, (0,0,255), 2)
-                cv2.drawMarker(img, lp, (0,0,255), cv2.MARKER_CROSS, 20, 2)
+                cv2.circle(frame, lp, 15, (0,0,255), 2)
+                cv2.drawMarker(frame, lp, (0,0,255), cv2.MARKER_CROSS, 20, 2)
             
             ip = pred.get_init_pos()
             if ip is not None:
                 ip2d = self.proj(ip)
                 if ip2d:
-                    cv2.circle(img, ip2d, 8, (0,255,0), 2)
+                    cv2.circle(frame, ip2d, 8, (0,255,0), 2)
             
             # Info box
             bx = w - 200
-            cv2.rectangle(img, (bx, 40), (w-5, 120), (30,30,30), -1)
-            cv2.rectangle(img, (bx, 40), (w-5, 120), (0,0,255), 1)
+            cv2.rectangle(frame, (bx, 40), (w-5, 120), (30,30,30), -1)
+            cv2.rectangle(frame, (bx, 40), (w-5, 120), (0,0,255), 1)
             lbl = "LOCKED" if pred.locked else "PRED"
-            cv2.putText(img, lbl, (bx+5, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.4, 
+            cv2.putText(frame, lbl, (bx+5, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.4, 
                        (0,255,0) if pred.locked else (0,200,255), 1)
-            cv2.putText(img, f"X:{land.x:+.2f} Z:{land.z:+.2f}", (bx+5, 75),
+            cv2.putText(frame, f"X:{land.x:+.2f} Z:{land.z:+.2f}", (bx+5, 75),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
-            cv2.putText(img, f"T:{land.time:.2f}s C:{land.confidence:.0%}", (bx+5, 95),
+            cv2.putText(frame, f"T:{land.time:.2f}s C:{land.confidence:.0%}", (bx+5, 95),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
         else:
             if pred.kf.init:
-                cv2.putText(img, f"Need {MIN_POINTS - pred.kf.n} more pts", (10, 50),
+                cv2.putText(frame, f"Need {MIN_POINTS - pred.kf.n} more pts", (10, 50),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100,100,255), 1)
         
-        cv2.putText(img, f"FPS:{fps:.0f}", (10,h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-        return img
+        cv2.putText(frame, f"FPS:{fps:.0f}", (10,h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        return frame
 
 
 def fuse(calib, cams, det0, det1, d0, d1):
@@ -404,23 +478,42 @@ def main():
     vis = Visualizer(cams.intrin[0])
     
     cv2.namedWindow("Trajectory", cv2.WINDOW_AUTOSIZE)
-    fps_q = deque(maxlen=20)
+    fps_q = deque(maxlen=30)
+    
+    # Optimization state
+    frame_count = 0
+    last_det1 = None
+    last_d1 = None
     
     print(f"\nDUAL-CAM TRAJECTORY | Ground:{GROUND_Y}m | Baseline:{calib.baseline*100:.1f}cm")
+    print(f"GPU: {'CUDA' if USE_GPU else 'CPU'} | Cam1 skip: {SKIP_CAM1_FRAMES}")
     print("q=quit r=reset\n")
     
     try:
         while True:
             t0 = time.time()
+            frame_count += 1
             
-            c0, d0 = cams.get_frames(0)
-            c1, d1 = cams.get_frames(1)
-            
+            # Camera 0: blocking wait
+            c0, d0 = cams.get_frames_cam0()
             if c0 is None:
                 continue
             
+            # Camera 1: non-blocking (threaded)
+            c1, d1 = cams.get_frames_cam1()
+            
+            # Always detect on Camera 0
             det0 = det.detect(c0, 0)
-            det1 = det.detect(c1, 1) if c1 is not None else None
+            
+            # Detect on Camera 1 every N frames (use cached otherwise)
+            if c1 is not None and frame_count % SKIP_CAM1_FRAMES == 0:
+                det1 = det.detect(c1, 1)
+                last_det1 = det1
+                last_d1 = d1
+            else:
+                det1 = last_det1
+                d1 = last_d1
+            
             fused_pos = fuse(calib, cams, det0, det1, d0, d1)
             
             if fused_pos is not None and not pred.locked:
@@ -429,6 +522,7 @@ def main():
             fps_q.append(time.time() - t0)
             fps = 1.0 / (sum(fps_q) / len(fps_q))
             
+            # Draw directly on c0 (no copy)
             frame = vis.draw(c0, det0, det1, pred, fused_pos, fps)
             cv2.imshow("Trajectory", frame)
             
@@ -437,6 +531,7 @@ def main():
                 break
             elif k == ord('r'):
                 pred.reset()
+                last_det1 = None
                 print("[RESET]")
     finally:
         cams.stop()
@@ -450,3 +545,4 @@ if __name__ == "__main__":
     
     print("Initializing (this may take a few seconds)...")
     main()
+
