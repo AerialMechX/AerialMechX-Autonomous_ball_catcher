@@ -1,19 +1,25 @@
 """
-Trajectory Predictor for Ball Landing Estimation
+Trajectory Predictor for Ball Landing Estimation (YOLO-based)
 
 This script predicts the landing coordinates of a thrown ball using:
-- RANSAC for robust outlier rejection
-- Quadratic regression for ballistic trajectory fitting
-- Kalman filtering for smooth position tracking
+- YOLO object detection with HSV fallback
+- Physics-based Kalman filtering
+- Velocity-based trajectory prediction
 
-Designed to work with ball_tracker_params.py for ZED camera-based ball tracking.
+Camera parameters are loaded from ../camera_parameters/ folder ONLY.
 
 Usage:
     python trajectory_predictor.py                    # Run with ZED camera
-    python trajectory_predictor.py --debug            # Enable visualization
     python trajectory_predictor.py --robot-ip 192.168.0.51  # Set robot IP
+    python trajectory_predictor.py --no-udp           # Disable UDP
+    python trajectory_predictor.py --no-gpu           # Disable GPU
 
-Based on the approach from dhrumilp15/mind-quidditch
+Controls:
+    q/ESC - Quit
+    r - Reset tracking
+    t - Switch to tennis ball HSV
+    p - Switch to paper ball HSV
+    u - Toggle UDP sending on/off
 """
 
 import numpy as np
@@ -23,640 +29,612 @@ import time
 import os
 import argparse
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, List
-from sklearn.linear_model import RANSACRegressor
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.pipeline import make_pipeline
-from filterpy.kalman import KalmanFilter
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-# Import from ball_tracker_params
-from ball_tracker_params import (
-    BallDetector, CameraIntrinsics, 
-    get_robust_depth, draw_detection,
-    RESOLUTION, FPS, DEPTH_MODE, UNIT,
-    HSV_TENNIS_BALL, HSV_PAPER_BALL, ACTIVE_HSV,
-    CAMERA_HEIGHT_ABOVE_GROUND, DEPTH_OFFSET,
-    MIN_BALL_AREA, MAX_BALL_AREA
-)
-from sender import UDPSender, DEFAULT_ROBOT_IP, DEFAULT_ROBOT_PORT
+from sender import UDPSender
 
 
 # ==================== CONFIGURATION ====================
 
-# Import trajectory prediction configuration constants from config
+# YOLO Configuration
+YOLO_MODEL = "yolov8n.pt"
+YOLO_CONFIDENCE = 0.35
+USE_GPU = True
+
+# Import from config
 from config import (
-    # Physics constants
-    GRAVITY,
-    
-    # Trajectory collection parameters
-    MIN_POINTS_FOR_PREDICTION,
-    MAX_TRAJECTORY_POINTS,
-    TRAJECTORY_TIMEOUT,
-    LANDING_HEIGHT,
-    
-    # RANSAC parameters
-    RANSAC_MIN_SAMPLES,
-    RANSAC_RESIDUAL_THRESHOLD,
-    RANSAC_MAX_TRIALS,
-    
-    # Throw detection thresholds
-    THROW_VELOCITY_THRESHOLD,
-    THROW_CONFIRM_FRAMES,
-    MIN_TRAJECTORY_DURATION,
-    
-    # Prediction confidence
-    MIN_PREDICTION_CONFIDENCE,
-    
-    # Performance optimization
-    PREDICTION_INTERVAL,
-    
-    # Logging
-    PREDICTION_LOG_FILE
+    RESOLUTION, FPS, DEPTH_MODE, UNIT,
+    HSV_TENNIS_BALL, HSV_PAPER_BALL, ACTIVE_HSV,
+    CAMERA_HEIGHT_ABOVE_GROUND, DEPTH_OFFSET,
+    MIN_BALL_AREA, MAX_BALL_AREA, MIN_CIRCULARITY,
+    DEFAULT_ROBOT_IP, DEFAULT_ROBOT_PORT, UDP_SEND_RATE,
+    GRAVITY
 )
+
+# Trajectory parameters
+MIN_POINTS = 5  # Minimum points before prediction
+MIN_CONF_LOCK = 0.35  # Minimum confidence to lock prediction
+MIN_TIME_TO_LAND = 0.05  # Minimum flight time to consider valid (seconds)
+MIN_THROW_VELOCITY = 1.5  # Minimum velocity to start tracking (m/s)
+# Ground Y in ZED coords: +Y is up, camera is 0.6m above ground
+GROUND_Y = -0.58  # Ground height relative to camera
+DEBUG_TRAJECTORY = True  # Print debug info
 
 
 # ==================== DATA CLASSES ====================
 
 @dataclass
-class TrajectoryPoint:
-    """Single point in the ball's trajectory"""
-    position: np.ndarray  # [x, y, z] in meters
-    timestamp: float
-    velocity: Optional[np.ndarray] = None
+class CameraParameters:
+    """Camera intrinsic and extrinsic parameters"""
+    intrinsic_matrix: np.ndarray
+    distortion: np.ndarray
+    rotation: np.ndarray
+    translation: np.ndarray
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
 
 
 @dataclass
-class LandingPrediction:
-    """Predicted landing information"""
-    position: np.ndarray  # [x, y, z] landing coordinates
-    time_to_land: float  # seconds until landing
-    confidence: float  # 0-1 confidence score
-    trajectory_points: List[np.ndarray] = field(default_factory=list)  # predicted path
+class CameraIntrinsics:
+    """Camera intrinsics for depth projection"""
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int
+    height: int
+
+
+@dataclass
+class Landing:
+    """Landing prediction result"""
+    x: float
+    y: float
+    z: float
+    time: float
+    confidence: float
+    
+    @property
+    def pos(self):
+        return np.array([self.x, self.y, self.z])
+
+
+# ==================== PARAMETER LOADING ====================
+
+def load_camera_parameters_from_files(camera_params_dir: str = '../camera_parameters'):
+    """Load camera parameters from .dat files (REQUIRED - no SDK fallback)"""
+    
+    def read_intrinsics_file(filepath):
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Camera parameters file not found: {filepath}")
+        
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        
+        intrinsic_matrix = []
+        dist_coeffs = []
+        reading_intrinsic = False
+        reading_distortion = False
+        
+        for line in lines:
+            line = line.strip()
+            if line == 'intrinsic:':
+                reading_intrinsic = True
+                reading_distortion = False
+                continue
+            elif line == 'distortion:':
+                reading_intrinsic = False
+                reading_distortion = True
+                continue
+            elif line == '':
+                continue
+            
+            if reading_intrinsic:
+                values = [float(x) for x in line.split()]
+                intrinsic_matrix.append(values)
+            elif reading_distortion:
+                dist_coeffs = [float(x) for x in line.split()]
+        
+        intrinsic_matrix = np.array(intrinsic_matrix, dtype=np.float32)
+        dist_coeffs = np.array(dist_coeffs, dtype=np.float32)
+        
+        return intrinsic_matrix, dist_coeffs
+    
+    def read_rot_trans_file(filepath):
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Camera parameters file not found: {filepath}")
+        
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        
+        rotation = []
+        translation = []
+        reading_rotation = False
+        reading_translation = False
+        
+        for line in lines:
+            line = line.strip()
+            if line == 'R:':
+                reading_rotation = True
+                reading_translation = False
+                continue
+            elif line == 'T:':
+                reading_rotation = False
+                reading_translation = True
+                continue
+            elif line == '':
+                continue
+            
+            if reading_rotation:
+                values = [float(x) for x in line.split()]
+                rotation.append(values)
+            elif reading_translation:
+                values = [float(x) for x in line.split()]
+                translation.extend(values)
+        
+        rotation = np.array(rotation, dtype=np.float32)
+        translation = np.array(translation, dtype=np.float32).reshape(3, 1)
+        
+        return rotation, translation
+    
+    # Load camera 0
+    cam0_intrinsic_path = os.path.join(camera_params_dir, 'camera0_intrinsics.dat')
+    cam0_rot_trans_path = os.path.join(camera_params_dir, 'camera0_rot_trans.dat')
+    
+    cam0_intrinsic, cam0_dist = read_intrinsics_file(cam0_intrinsic_path)
+    cam0_rot, cam0_trans = read_rot_trans_file(cam0_rot_trans_path)
+    
+    width, height = 1280, 720
+    
+    cam0_params = CameraParameters(
+        intrinsic_matrix=cam0_intrinsic,
+        distortion=cam0_dist,
+        rotation=cam0_rot,
+        translation=cam0_trans,
+        width=width,
+        height=height,
+        fx=cam0_intrinsic[0, 0],
+        fy=cam0_intrinsic[1, 1],
+        cx=cam0_intrinsic[0, 2],
+        cy=cam0_intrinsic[1, 2]
+    )
+    
+    print(f"✓ Loaded camera parameters from {camera_params_dir}/")
+    print(f"  Camera 0: fx={cam0_params.fx:.2f}, fy={cam0_params.fy:.2f}")
+    
+    return cam0_params
 
 
 # ==================== KALMAN FILTER ====================
 
-class BallKalmanFilter:
-    """
-    6-state Kalman filter for 3D ball tracking
-    State: [x, y, z, vx, vy, vz]
-    """
+class KalmanFilter:
+    """Physics-based Kalman filter for ball trajectory."""
     
-    def __init__(self, dt: float = 1/30):
-        self.dt = dt
-        self.kf = KalmanFilter(dim_x=6, dim_z=3)
-        
-        # State transition matrix (constant velocity model with gravity)
-        self.kf.F = np.array([
-            [1, 0, 0, dt, 0, 0],
-            [0, 1, 0, 0, dt, 0],
-            [0, 0, 1, 0, 0, dt],
-            [0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 0, 1]
-        ])
-        
-        # Measurement matrix (we only measure position)
-        self.kf.H = np.array([
-            [1, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0],
-            [0, 0, 1, 0, 0, 0]
-        ])
-        
-        # Measurement noise
-        self.kf.R = np.eye(3) * 0.05  # 5cm measurement noise
-        
-        # Process noise (accounts for model uncertainty)
-        q = 0.1
-        self.kf.Q = np.eye(6) * q
-        self.kf.Q[3:, 3:] *= 2  # Higher noise for velocity
-        
-        # Control input matrix (for gravity)
-        self.kf.B = np.array([
-            [0],
-            [0.5 * dt**2],  # gravity affects y position
-            [0],
-            [0],
-            [dt],  # gravity affects vy
-            [0]
-        ])
-        
-        # Initial covariance
-        self.kf.P *= 1000
-        
-        self.initialized = False
+    def __init__(self, g=GRAVITY, q=0.01, r=0.02):
+        self.g = g
+        self.state = np.zeros(6)  # [x, y, z, vx, vy, vz]
+        self.P = np.eye(6)
+        self.Q_base = q
+        self.R = np.eye(3) * r
+        self.H = np.zeros((3, 6))
+        self.H[0, 0] = self.H[1, 1] = self.H[2, 2] = 1
+        self.init = False
+        self.n = 0
+        self.t_last = None
     
-    def initialize(self, position: np.ndarray):
-        """Initialize filter with first measurement"""
-        pos = np.asarray(position).flatten()
-        # filterpy expects state as column vector (n, 1)
-        self.kf.x = np.array([
-            [pos[0]], [pos[1]], [pos[2]],
-            [0.0], [0.0], [0.0]  # Initial velocity unknown
-        ])
-        self.initialized = True
-    
-    def predict(self) -> np.ndarray:
-        """Predict next state with gravity"""
-        u = np.array([[-GRAVITY]])  # gravity in -y direction
-        self.kf.predict(u=u)
-        # Extract position as 1D array (kf.x is column vector shape (6,1))
-        return np.array([self.kf.x[0, 0], self.kf.x[1, 0], self.kf.x[2, 0]])
-    
-    def update(self, measurement: np.ndarray) -> np.ndarray:
-        """Update with new measurement"""
-        if not self.initialized:
-            self.initialize(measurement)
+    def update(self, m, t):
+        m = np.asarray(m).flatten()[:3]
         
-        # filterpy expects measurement as 1D array or column vector
-        meas = np.asarray(measurement).flatten()
-        self.kf.update(meas)
-        # Extract position as 1D array (kf.x is column vector shape (6,1))
-        return np.array([self.kf.x[0, 0], self.kf.x[1, 0], self.kf.x[2, 0]])
+        if not self.init:
+            self.state[:3] = m
+            self.init = True
+            self.t_last = t
+            self.n = 1
+            return self.state.copy()
+        
+        dt = t - self.t_last
+        if dt > 0:
+            # Predict step
+            F = np.eye(6)
+            F[0, 3] = F[1, 4] = F[2, 5] = dt
+            B = np.zeros(6)
+            B[1] = -0.5 * self.g * dt**2  # Gravity in -Y direction
+            B[4] = -self.g * dt
+            self.state = F @ self.state + B
+            self.P = F @ self.P @ F.T + np.eye(6) * self.Q_base * dt
+        
+        self.t_last = t
+        
+        # Update step
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.state = self.state + K @ (m - self.H @ self.state)
+        self.P = (np.eye(6) - K @ self.H) @ self.P
+        self.n += 1
+        
+        return self.state.copy()
     
-    def get_state(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Get current position and velocity"""
-        pos = np.array([self.kf.x[0, 0], self.kf.x[1, 0], self.kf.x[2, 0]])
-        vel = np.array([self.kf.x[3, 0], self.kf.x[4, 0], self.kf.x[5, 0]])
-        return pos, vel
+    def pos(self):
+        return self.state[:3].copy()
+    
+    def vel(self):
+        return self.state[3:].copy()
     
     def reset(self):
-        """Reset filter state"""
-        self.kf.x = np.zeros((6, 1))  # Column vector
-        self.kf.P = np.eye(6) * 1000
-        self.initialized = False
+        self.state = np.zeros(6)
+        self.P = np.eye(6)
+        self.init = False
+        self.n = 0
+        self.t_last = None
 
 
 # ==================== TRAJECTORY PREDICTOR ====================
 
 class TrajectoryPredictor:
-    """
-    Predicts ball landing position using RANSAC and quadratic regression.
+    """Predicts ball landing position using raw position tracking and physics."""
     
-    The ball follows ballistic trajectory:
-        x(t) = x0 + vx*t
-        y(t) = y0 + vy*t - 0.5*g*t^2
-        z(t) = z0 + vz*t
+    def __init__(self, g=GRAVITY, ground=GROUND_Y):
+        self.g = g
+        self.ground = ground
+        
+        # Track raw positions and times
+        self.pos_hist = deque(maxlen=15)  # Buffer of (pos, time) tuples
+        self.n = 0  # Total measurements
+        
+        # Prediction locking
+        self.locked = False
+        self.lock_pos = None
+        self.lock_vel = None
+        self.lock_land = None
+        self.lock_time = 0
+        self.current = None
     
-    We fit quadratic to y vs t, and linear to x,z vs t.
-    """
+    def _compute_velocity(self):
+        """Compute velocity from recent position history using linear regression."""
+        if len(self.pos_hist) < 3:
+            return None
+        
+        # Use last 8 points for velocity estimation
+        recent = list(self.pos_hist)[-8:]
+        positions = np.array([p[0] for p in recent])
+        times = np.array([p[1] for p in recent])
+        
+        # Center times for numerical stability
+        t0 = times[0]
+        times_centered = times - t0
+        
+        if times_centered[-1] - times_centered[0] < 0.05:  # Need at least 50ms span
+            return None
+        
+        # Simple linear fit: pos = pos0 + vel * t
+        # Use least squares: vel = sum((t - t_mean)(pos - pos_mean)) / sum((t - t_mean)^2)
+        t_mean = np.mean(times_centered)
+        pos_mean = np.mean(positions, axis=0)
+        
+        numerator = np.zeros(3)
+        denominator = 0.0
+        for i in range(len(recent)):
+            dt = times_centered[i] - t_mean
+            dpos = positions[i] - pos_mean
+            numerator += dt * dpos
+            denominator += dt * dt
+        
+        if denominator < 1e-6:
+            return None
+        
+        velocity = numerator / denominator
+        return velocity
     
-    def __init__(self, debug: bool = False):
-        self.debug = debug
-        self.trajectory_history: deque = deque(maxlen=MAX_TRAJECTORY_POINTS)
-        self.kalman_filter = BallKalmanFilter(dt=1/FPS)
+    def update(self, pos, t):
+        if self.locked:
+            return self.lock_land
         
-        self.is_throwing = False
-        self.throw_start_time = 0
-        self.last_detection_time = 0
-        self.last_position = None
-        self.last_velocity = None
+        # Store raw position
+        pos = np.asarray(pos)
+        self.pos_hist.append((pos.copy(), t))
+        self.n += 1
         
-        # Throw detection state
-        self.high_velocity_frames = 0  # Count of consecutive high-velocity frames
-        self.throw_confirmed = False  # True once throw is confirmed
-        self.pre_throw_positions = deque(maxlen=5)  # Store positions before throw for reference
+        # Compute velocity from position history
+        vel = self._compute_velocity()
         
-        # RANSAC regressors
-        self.ransac_x = RANSACRegressor(
-            min_samples=RANSAC_MIN_SAMPLES,
-            residual_threshold=RANSAC_RESIDUAL_THRESHOLD,
-            max_trials=RANSAC_MAX_TRIALS
-        )
-        self.ransac_y = RANSACRegressor(
-            min_samples=RANSAC_MIN_SAMPLES,
-            residual_threshold=RANSAC_RESIDUAL_THRESHOLD,
-            max_trials=RANSAC_MAX_TRIALS
-        )
-        self.ransac_z = RANSACRegressor(
-            min_samples=RANSAC_MIN_SAMPLES,
-            residual_threshold=RANSAC_RESIDUAL_THRESHOLD,
-            max_trials=RANSAC_MAX_TRIALS
-        )
+        if vel is not None:
+            speed = np.linalg.norm(vel)
+            
+            # Debug output
+            if DEBUG_TRAJECTORY and self.n % 5 == 0:
+                print(f"[DEBUG] Points: {self.n}, Speed: {speed:.2f} m/s, Pos: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}], Vel: [{vel[0]:.2f}, {vel[1]:.2f}, {vel[2]:.2f}]")
+            
+            # Need minimum points and velocity for prediction
+            if self.n >= MIN_POINTS and speed >= MIN_THROW_VELOCITY:
+                self.current = self._predict(pos, vel)
+                if self.current:
+                    if DEBUG_TRAJECTORY:
+                        print(f"[DEBUG] Prediction: X={self.current.x:.2f}, Z={self.current.z:.2f}, T={self.current.time:.2f}s, Conf={self.current.confidence:.0%}")
+                    
+                    # Check if should lock
+                    lock_result, reason = self._should_lock()
+                    if lock_result:
+                        self.locked = True
+                        self.lock_pos = pos.copy()
+                        self.lock_vel = vel.copy()
+                        self.lock_land = self.current
+                        self.lock_time = self.current.time
+                        self._print_prediction()
+                    elif DEBUG_TRAJECTORY:
+                        print(f"[DEBUG] Not locking: {reason}")
+                elif DEBUG_TRAJECTORY and self.n % 10 == 0:
+                    # Show why prediction failed
+                    a = -0.5 * self.g
+                    b = vel[1]
+                    c = pos[1] - self.ground
+                    disc = b*b - 4*a*c
+                    print(f"[DEBUG] No prediction: pos_y={pos[1]:.2f}, vel_y={vel[1]:.2f}, disc={disc:.2f}")
+            elif DEBUG_TRAJECTORY and self.n % 10 == 0:
+                print(f"[DEBUG] Waiting: speed={speed:.2f} m/s (need >= {MIN_THROW_VELOCITY})")
         
-        # Fitted coefficients
-        self.x_coeffs = None  # [x0, vx] linear
-        self.y_coeffs = None  # [y0, vy, -0.5*g] quadratic
-        self.z_coeffs = None  # [z0, vz] linear
-        
-        self.prediction_confidence = 0.0
-        
-        # Prediction tracking
-        self.prediction_made = False
-        self.prediction_locked = False
-        self._prediction_count = 0
+        return self.current
     
-    def add_point(self, position: np.ndarray, timestamp: float):
-        """Add a new trajectory point with improved throw detection"""
-        # If prediction is already locked, just update position tracking for display
-        # but don't process for new predictions
-        if self.prediction_locked:
-            position = np.asarray(position).flatten()
-            if self.last_position is not None and self.last_detection_time > 0:
-                dt = timestamp - self.last_detection_time
-                if dt > 0 and dt < 0.5:
-                    self.last_velocity = (position - self.last_position) / dt
-            self.last_position = position.copy()
-            self.last_detection_time = timestamp
+    def _should_lock(self):
+        """Check if prediction should be locked. Returns (bool, reason)"""
+        if self.current is None:
+            return False, "No prediction"
+        
+        # Must have sufficient confidence
+        if self.current.confidence < MIN_CONF_LOCK:
+            return False, f"Low confidence: {self.current.confidence:.0%} < {MIN_CONF_LOCK:.0%}"
+        
+        # Must have reasonable flight time remaining
+        if self.current.time < MIN_TIME_TO_LAND:
+            return False, f"Short flight: {self.current.time:.2f}s < {MIN_TIME_TO_LAND}s"
+        
+        # Landing shouldn't be too far away (sanity check)
+        if abs(self.current.x) > 10 or abs(self.current.z) > 15:
+            return False, f"Too far: X={self.current.x:.1f}, Z={self.current.z:.1f}"
+        
+        return True, "OK"
+    
+    def _predict(self, pos, vel):
+        """Predict landing position given current position and velocity."""
+        # Solve y(t) = ground for t
+        # y0 + vy*t - 0.5*g*t^2 = ground
+        # -0.5*g*t^2 + vy*t + (y0 - ground) = 0
+        a = -0.5 * self.g
+        b = vel[1]
+        c = pos[1] - self.ground
+        
+        disc = b*b - 4*a*c
+        if disc < 0:
+            return None
+        
+        t1 = (-b + np.sqrt(disc)) / (2*a)
+        t2 = (-b - np.sqrt(disc)) / (2*a)
+        ts = [t for t in [t1, t2] if t > MIN_TIME_TO_LAND]
+        if not ts:
+            return None
+        
+        t_land = min(ts)
+        x_land = pos[0] + vel[0] * t_land
+        z_land = pos[2] + vel[2] * t_land
+        
+        # Confidence based on number of points and flight time
+        n_factor = min(1.0, self.n / 12)
+        time_factor = min(1.0, t_land / 0.5)  # Full credit at 0.5s+
+        
+        conf = 0.5 * n_factor + 0.5 * time_factor
+        
+        return Landing(x_land, self.ground, z_land, t_land, float(np.clip(conf, 0, 1)))
+    
+    def _print_prediction(self):
+        """Print and save prediction"""
+        if self.lock_land is None:
             return
         
-        # Ensure position is a flat 1D array
-        position = np.asarray(position).flatten()
-        
-        # Update Kalman filter
-        if self.kalman_filter.initialized:
-            self.kalman_filter.predict()
-        filtered_pos = self.kalman_filter.update(position)
-        
-        # Calculate velocity
-        velocity = None
-        speed = 0.0
-        if self.last_position is not None and self.last_detection_time > 0:
-            dt = timestamp - self.last_detection_time
-            if dt > 0 and dt < 0.5:  # Ignore if too much time passed (detection gap)
-                velocity = (position - self.last_position) / dt
-                speed = np.linalg.norm(velocity)
-        
-        # Throw detection state machine
-        if not self.throw_confirmed:
-            # Store pre-throw positions
-            self.pre_throw_positions.append((filtered_pos.copy(), timestamp))
-            
-            if velocity is not None:
-                if speed > THROW_VELOCITY_THRESHOLD:
-                    # High velocity detected
-                    self.high_velocity_frames += 1
-                    if self.debug:
-                        print(f"[THROW CHECK] High velocity frame {self.high_velocity_frames}/{THROW_CONFIRM_FRAMES}, speed: {speed:.2f} m/s")
-                    
-                    if self.high_velocity_frames >= THROW_CONFIRM_FRAMES:
-                        # Throw confirmed!
-                        self.throw_confirmed = True
-                        self.is_throwing = True
-                        self.throw_start_time = timestamp
-                        self.trajectory_history.clear()
-                        
-                        # Add the recent high-velocity points to trajectory
-                        # (points from when we started seeing high velocity)
-                        if self.debug:
-                            print(f"[THROW CONFIRMED] Speed: {speed:.2f} m/s - starting trajectory collection")
-                else:
-                    # Low velocity - reset counter
-                    if self.high_velocity_frames > 0 and self.debug:
-                        print(f"[THROW CHECK] Reset - speed dropped to {speed:.2f} m/s")
-                    self.high_velocity_frames = 0
-        
-        # Only add to trajectory history if throw is confirmed
-        if self.throw_confirmed:
-            point = TrajectoryPoint(
-                position=filtered_pos.copy(),
-                timestamp=timestamp,
-                velocity=velocity.copy() if velocity is not None else None
-            )
-            self.trajectory_history.append(point)
-        
-        self.last_position = position.copy()
-        self.last_velocity = velocity.copy() if velocity is not None else None
-        self.last_detection_time = timestamp
-    
-    def can_predict(self) -> bool:
-        """Check if we have enough data to make a prediction"""
-        if not self.throw_confirmed:
-            return False
-        
-        if len(self.trajectory_history) < MIN_POINTS_FOR_PREDICTION:
-            return False
-        
-        # Check minimum trajectory duration
-        if len(self.trajectory_history) >= 2:
-            duration = self.trajectory_history[-1].timestamp - self.trajectory_history[0].timestamp
-            if duration < MIN_TRAJECTORY_DURATION:
-                if self.debug:
-                    print(f"[PREDICT] Trajectory too short: {duration:.3f}s < {MIN_TRAJECTORY_DURATION}s")
-                return False
-        
-        return True
-    
-    def fit_trajectory(self) -> bool:
-        """Fit trajectory using RANSAC regression with fallback to simple least squares"""
-        if len(self.trajectory_history) < MIN_POINTS_FOR_PREDICTION:
-            if self.debug:
-                print(f"[FIT] Not enough points: {len(self.trajectory_history)} < {MIN_POINTS_FOR_PREDICTION}")
-            return False
-        
-        # Extract data
-        times = []
-        positions = []
-        
-        t0 = self.trajectory_history[0].timestamp
-        for point in self.trajectory_history:
-            t = point.timestamp - t0
-            times.append(t)
-            # Ensure position is exactly 3 elements
-            pos = np.asarray(point.position).flatten()
-            if len(pos) >= 3:
-                positions.append(pos[:3])  # Take only first 3 elements
-        
-        if len(positions) < MIN_POINTS_FOR_PREDICTION:
-            if self.debug:
-                print(f"[FIT] Not enough valid positions: {len(positions)}")
-            return False
-        
-        times = np.array(times[:len(positions)]).reshape(-1, 1)
-        positions = np.array(positions)  # Should be (n, 3)
-        
-        if self.debug:
-            print(f"[FIT] Fitting with {len(positions)} points, time span: {times[-1,0]:.3f}s")
-        
-        try:
-            # Try RANSAC first, fall back to simple least squares if it fails
-            try:
-                # Fit x(t) = x0 + vx*t (linear)
-                self.ransac_x.fit(times, positions[:, 0])
-                self.x_coeffs = [
-                    np.asarray(self.ransac_x.estimator_.intercept_).item(),
-                    np.asarray(self.ransac_x.estimator_.coef_[0]).item()
-                ]
-            except Exception:
-                # Fallback to simple least squares
-                coeffs = np.polyfit(times.flatten(), positions[:, 0], 1)
-                self.x_coeffs = [coeffs[1], coeffs[0]]  # [intercept, slope]
-            
-            try:
-                # Fit y(t) = y0 + vy*t + a*t^2 (quadratic)
-                times_quad = np.column_stack([times, times**2])
-                self.ransac_y.fit(times_quad, positions[:, 1])
-                self.y_coeffs = [
-                    np.asarray(self.ransac_y.estimator_.intercept_).item(),
-                    np.asarray(self.ransac_y.estimator_.coef_[0]).item(),
-                    np.asarray(self.ransac_y.estimator_.coef_[1]).item()
-                ]
-            except Exception:
-                # Fallback to simple quadratic fit
-                coeffs = np.polyfit(times.flatten(), positions[:, 1], 2)
-                self.y_coeffs = [coeffs[2], coeffs[1], coeffs[0]]  # [y0, vy, a]
-            
-            try:
-                # Fit z(t) = z0 + vz*t (linear)
-                self.ransac_z.fit(times, positions[:, 2])
-                self.z_coeffs = [
-                    np.asarray(self.ransac_z.estimator_.intercept_).item(),
-                    np.asarray(self.ransac_z.estimator_.coef_[0]).item()
-                ]
-            except Exception:
-                # Fallback to simple least squares
-                coeffs = np.polyfit(times.flatten(), positions[:, 2], 1)
-                self.z_coeffs = [coeffs[1], coeffs[0]]  # [intercept, slope]
-            
-            # Calculate predictions for confidence
-            x_pred = self.x_coeffs[0] + self.x_coeffs[1] * times.flatten()
-            y_pred = self.y_coeffs[0] + self.y_coeffs[1] * times.flatten() + self.y_coeffs[2] * times.flatten()**2
-            z_pred = self.z_coeffs[0] + self.z_coeffs[1] * times.flatten()
-            
-            # Calculate R^2 for each dimension
-            ss_res_x = np.sum((positions[:, 0] - x_pred)**2)
-            ss_tot_x = np.sum((positions[:, 0] - np.mean(positions[:, 0]))**2)
-            ss_res_y = np.sum((positions[:, 1] - y_pred)**2)
-            ss_tot_y = np.sum((positions[:, 1] - np.mean(positions[:, 1]))**2)
-            ss_res_z = np.sum((positions[:, 2] - z_pred)**2)
-            ss_tot_z = np.sum((positions[:, 2] - np.mean(positions[:, 2]))**2)
-            
-            r2_x = 1 - ss_res_x / ss_tot_x if ss_tot_x > 0 else 0
-            r2_y = 1 - ss_res_y / ss_tot_y if ss_tot_y > 0 else 0
-            r2_z = 1 - ss_res_z / ss_tot_z if ss_tot_z > 0 else 0
-            
-            # Average R^2, clamped to [0, 1]
-            self.prediction_confidence = max(0, min(1, (r2_x + r2_y + r2_z) / 3))
-            
-            if self.debug:
-                print(f"[FIT] y_coeffs: y0={self.y_coeffs[0]:.3f}, vy={self.y_coeffs[1]:.3f}, a={self.y_coeffs[2]:.3f}")
-                print(f"[FIT] Confidence: {self.prediction_confidence:.2f} (R2: x={r2_x:.2f}, y={r2_y:.2f}, z={r2_z:.2f})")
-            
-            return True
-            
-        except Exception as e:
-            if self.debug:
-                print(f"[FIT ERROR] {e}")
-            return False
-    
-    def predict_landing(self) -> Optional[LandingPrediction]:
-        """Predict where and when the ball will land"""
-        # First check if we can predict (throw confirmed, enough points, enough duration)
-        if not self.can_predict():
-            return None
-        
-        if not self.fit_trajectory():
-            return None
-        
-        if self.y_coeffs is None:
-            if self.debug:
-                print("[PREDICT] y_coeffs is None")
-            return None
-        
-        if self.prediction_confidence < MIN_PREDICTION_CONFIDENCE:
-            if self.debug:
-                print(f"[PREDICT] Confidence too low: {self.prediction_confidence:.2f} < {MIN_PREDICTION_CONFIDENCE}")
-            return None
-        
-        # Solve y(t) = LANDING_HEIGHT for t
-        # y0 + vy*t + a*t^2 = LANDING_HEIGHT
-        # a*t^2 + vy*t + (y0 - LANDING_HEIGHT) = 0
-        a = self.y_coeffs[2]
-        b = self.y_coeffs[1]
-        c = self.y_coeffs[0] - LANDING_HEIGHT
-        
-        # Check if ball is actually falling (a should be negative for downward parabola)
-        if self.debug:
-            print(f"[PREDICT] Quadratic: a={a:.4f}, b={b:.4f}, c={c:.4f}")
-        
-        discriminant = b**2 - 4*a*c
-        
-        if discriminant < 0:
-            if self.debug:
-                print(f"[PREDICT] Negative discriminant: {discriminant:.4f} - ball won't reach ground")
-            return None
-        
-        # Quadratic formula - take the positive root (future time)
-        t0 = self.trajectory_history[0].timestamp
-        current_t = self.last_detection_time - t0
-        
-        if abs(a) < 1e-6:
-            # Nearly linear, use linear solution
-            if abs(b) > 1e-6:
-                t1 = t2 = -c / b
-            else:
-                if self.debug:
-                    print("[PREDICT] Both a and b are near zero")
-                return None
-        else:
-            t1 = (-b + np.sqrt(discriminant)) / (2*a)
-            t2 = (-b - np.sqrt(discriminant)) / (2*a)
-        
-        # Choose future time that makes sense
-        landing_times = [t for t in [t1, t2] if t > current_t]
-        if not landing_times:
-            return None
-        
-        landing_t = min(landing_times)
-        
-        # Predict landing position
-        landing_x = float(self.x_coeffs[0] + self.x_coeffs[1] * landing_t)
-        landing_y = float(LANDING_HEIGHT)
-        landing_z = float(self.z_coeffs[0] + self.z_coeffs[1] * landing_t)
-        
-        landing_pos = np.array([landing_x, landing_y, landing_z], dtype=np.float64)
-        time_to_land = float(landing_t - current_t)
-        
-        # Generate trajectory points for visualization
-        trajectory_points = []
-        num_points = 10  # Reduced from 20 for performance
-        for i in range(num_points):
-            t = current_t + (landing_t - current_t) * i / (num_points - 1)
-            x = float(self.x_coeffs[0] + self.x_coeffs[1] * t)
-            y = float(self.y_coeffs[0] + self.y_coeffs[1] * t + self.y_coeffs[2] * t**2)
-            z = float(self.z_coeffs[0] + self.z_coeffs[1] * t)
-            trajectory_points.append(np.array([x, y, z], dtype=np.float64))
-        
-        return LandingPrediction(
-            position=landing_pos,
-            time_to_land=time_to_land,
-            confidence=self.prediction_confidence,
-            trajectory_points=trajectory_points
-        )
-    
-    def _save_and_print_prediction(self, prediction: LandingPrediction, 
-                                     current_pos: np.ndarray, current_vel: np.ndarray):
-        """Save prediction to file and print to console"""
-        self._prediction_count += 1
-        vel_mag = np.linalg.norm(current_vel)
-        
-        # Print to console
+        land = self.lock_land
         print("\n" + "=" * 50)
-        print(f"  TRAJECTORY PREDICTION #{self._prediction_count}")
+        print("  TRAJECTORY PREDICTION (LOCKED)")
         print("=" * 50)
-        print(f"  Current Position: [{current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}] m")
-        print(f"  Current Velocity: [{current_vel[0]:.3f}, {current_vel[1]:.3f}, {current_vel[2]:.3f}] m/s")
-        print(f"  Velocity Magnitude: {vel_mag:.3f} m/s")
+        print(f"  Initial Position: [{self.lock_pos[0]:.3f}, {self.lock_pos[1]:.3f}, {self.lock_pos[2]:.3f}] m")
+        print(f"  Initial Velocity: [{self.lock_vel[0]:.3f}, {self.lock_vel[1]:.3f}, {self.lock_vel[2]:.3f}] m/s")
         print("-" * 50)
-        print(f"  LANDING POSITION: [{prediction.position[0]:.3f}, {prediction.position[1]:.3f}, {prediction.position[2]:.3f}] m")
-        print(f"  TIME TO LANDING: {prediction.time_to_land:.3f} seconds")
-        print(f"  CONFIDENCE: {prediction.confidence:.0%}")
+        print(f"  LANDING POSITION: X={land.x:+.3f}m  Z={land.z:+.3f}m")
+        print(f"  TIME TO LANDING: {land.time:.3f} seconds")
+        print(f"  CONFIDENCE: {land.confidence:.0%}")
         print("=" * 50)
         print("  Press [R] to reset and predict new throw")
         print("=" * 50 + "\n")
         
-        # Save to predictions.txt
+        # Save to file
+        log_file = "predictions.txt"
         timestamp_str = time.strftime("%Y-%m-%d %H:%M:%S")
-        write_header = not os.path.exists(PREDICTION_LOG_FILE)
+        write_header = not os.path.exists(log_file)
         
-        with open(PREDICTION_LOG_FILE, 'a') as f:
+        with open(log_file, 'a') as f:
             if write_header:
                 f.write("=" * 80 + "\n")
                 f.write("TRAJECTORY PREDICTION LOG\n")
                 f.write("=" * 80 + "\n\n")
             
             f.write("-" * 80 + "\n")
-            f.write(f"Prediction #{self._prediction_count} | {timestamp_str}\n")
+            f.write(f"{timestamp_str}\n")
             f.write("-" * 80 + "\n")
-            
-            f.write(f"Initial Position (m): {current_pos[0]:.4f}, {current_pos[1]:.4f}, {current_pos[2]:.4f}\n")
-            f.write(f"Initial Velocity (m/s): {current_vel[0]:.4f}, {current_vel[1]:.4f}, {current_vel[2]:.4f}\n")
-            f.write(f"Speed (m/s): {vel_mag:.4f}\n\n")
-            
-            f.write(f"LANDING (m): {prediction.position[0]:.4f}, {prediction.position[1]:.4f}, {prediction.position[2]:.4f}\n")
-            f.write(f"TIME TO LAND (s): {prediction.time_to_land:.4f}\n")
-            f.write(f"CONFIDENCE: {prediction.confidence:.4f}\n\n")
-            
-            # Trajectory samples
-            f.write("Trajectory samples:\n")
-            n_points = len(prediction.trajectory_points)
-            sample_indices = [0, n_points//4, n_points//2, 3*n_points//4, n_points-1]
-            sample_indices = sorted(set([i for i in sample_indices if 0 <= i < n_points]))
-            
-            for i in sample_indices:
-                pt = prediction.trajectory_points[i]
-                # Calculate relative time from current position
-                idx_ratio = i / max(1, n_points - 1)
-                t = idx_ratio * prediction.time_to_land
-                f.write(f"  t={t:.2f}s: ({pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f})\n")
-            
-            f.write("\n")
+            f.write(f"Initial Position (m): {self.lock_pos[0]:.4f}, {self.lock_pos[1]:.4f}, {self.lock_pos[2]:.4f}\n")
+            f.write(f"Initial Velocity (m/s): {self.lock_vel[0]:.4f}, {self.lock_vel[1]:.4f}, {self.lock_vel[2]:.4f}\n")
+            f.write(f"LANDING (m): X={land.x:.4f}, Y={land.y:.4f}, Z={land.z:.4f}\n")
+            f.write(f"TIME TO LAND (s): {land.time:.4f}\n")
+            f.write(f"CONFIDENCE: {land.confidence:.4f}\n\n")
         
-        print(f"[SAVED] Appended to: {PREDICTION_LOG_FILE}")
+        print(f"[SAVED] Appended to: {log_file}")
     
-    def check_timeout(self, current_time: float) -> bool:
-        """Check if trajectory should be cleared due to timeout (but keep prediction locked)"""
-        if self.last_detection_time > 0:
-            if current_time - self.last_detection_time > TRAJECTORY_TIMEOUT:
-                # Only reset trajectory data, NOT the prediction lock
-                self._soft_reset()
-                return True
-        return False
-    
-    def _soft_reset(self):
-        """Reset trajectory tracking but keep prediction locked"""
-        self.trajectory_history.clear()
-        self.kalman_filter.reset()
-        self.is_throwing = False
-        self.throw_start_time = 0
-        self.last_detection_time = 0
-        self.last_position = None
-        self.last_velocity = None
-        self.x_coeffs = None
-        self.y_coeffs = None
-        self.z_coeffs = None
-        
-        # Reset throw detection state
-        self.high_velocity_frames = 0
-        self.throw_confirmed = False
-        self.pre_throw_positions.clear()
-        
-        # Do NOT reset prediction_locked or prediction_made here
-        if self.prediction_locked:
-            print("[TIMEOUT] Trajectory cleared - prediction remains LOCKED (press R to reset)")
+    def get_traj_pts(self, n=40):
+        """Get trajectory points for visualization"""
+        if self.locked:
+            if self.lock_pos is None:
+                return None
+            p, v, t = self.lock_pos, self.lock_vel, self.lock_time
         else:
-            print("[TIMEOUT] Trajectory cleared - ready for new throw")
+            if self.current is None or len(self.pos_hist) < 2:
+                return None
+            # Use latest position and computed velocity
+            p = self.pos_hist[-1][0]
+            v = self._compute_velocity()
+            if v is None:
+                return None
+            t = self.current.time
+        
+        ts = np.linspace(0, t, n)
+        pts = []
+        for ti in ts:
+            pts.append([p[0] + v[0]*ti, 
+                       p[1] + v[1]*ti - 0.5*self.g*ti**2, 
+                       p[2] + v[2]*ti])
+        return np.array(pts)
+    
+    def get_land(self):
+        return self.lock_land if self.locked else self.current
+    
+    def get_init_pos(self):
+        return self.lock_pos if self.locked else None
     
     def reset(self):
-        """Full reset - only called by user pressing 'R' key"""
-        self.trajectory_history.clear()
-        self.kalman_filter.reset()
-        self.is_throwing = False
-        self.throw_start_time = 0
-        self.last_detection_time = 0
-        self.last_position = None
-        self.last_velocity = None
-        self.x_coeffs = None
-        self.y_coeffs = None
-        self.z_coeffs = None
-        self.prediction_confidence = 0.0
+        self.pos_hist.clear()
+        self.n = 0
+        self.locked = False
+        self.lock_pos = self.lock_vel = self.lock_land = None
+        self.lock_time = 0
+        self.current = None
+        print("[RESET] Ready for new throw")
+
+
+# ==================== BALL DETECTOR (YOLO + HSV) ====================
+
+class BallDetector:
+    """Detects ball using YOLO with HSV fallback"""
+    
+    def __init__(self, hsv_config: dict, use_gpu: bool = True):
+        print("Loading YOLO model...")
+        from ultralytics import YOLO
+        self.model = YOLO(YOLO_MODEL)
         
-        # Reset throw detection state
-        self.high_velocity_frames = 0
-        self.throw_confirmed = False
-        self.pre_throw_positions.clear()
+        if use_gpu:
+            try:
+                self.model.to("cuda")
+                print("✓ YOLO using CUDA GPU")
+            except Exception as e:
+                print(f"  GPU unavailable, using CPU: {e}")
         
-        # Reset prediction tracking - ONLY on manual reset
-        self.prediction_made = False
-        self.prediction_locked = False
+        # Warmup
+        self.model.predict(np.zeros((320, 320, 3), dtype=np.uint8), verbose=False)
         
-        print("[RESET] Full reset - ready for new throw detection")
+        self.lower = np.array(hsv_config['lower'])
+        self.upper = np.array(hsv_config['upper'])
+        self.kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5))
+        self.last_method = None
+        print("✓ Ball detector ready (YOLO + HSV fallback)")
+    
+    def set_hsv_range(self, lower: tuple, upper: tuple):
+        self.lower = np.array(lower)
+        self.upper = np.array(upper)
+    
+    def detect(self, frame: np.ndarray) -> Optional[Tuple[int, int, int]]:
+        """Detect ball. Returns (x, y, radius) or None"""
+        # Try YOLO first
+        results = self.model.predict(frame, conf=YOLO_CONFIDENCE, classes=[32],
+                                      verbose=False, imgsz=320)
+        for result in results:
+            if len(result.boxes) > 0:
+                box = result.boxes[0]
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                radius = max(x2 - x1, y2 - y1) / 2
+                if 5 < radius < 150:
+                    self.last_method = 'YOLO'
+                    return (int(cx), int(cy), int(radius))
+        
+        # HSV fallback
+        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+        mask = cv.inRange(hsv, self.lower, self.upper)
+        mask = cv.erode(mask, self.kernel, iterations=1)
+        mask = cv.dilate(mask, self.kernel, iterations=2)
+        
+        contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in sorted(contours, key=cv.contourArea, reverse=True)[:3]:
+            area = cv.contourArea(cnt)
+            if MIN_BALL_AREA < area < MAX_BALL_AREA:
+                perim = cv.arcLength(cnt, True)
+                if perim > 0 and 4 * np.pi * area / perim**2 > MIN_CIRCULARITY:
+                    (cx, cy), radius = cv.minEnclosingCircle(cnt)
+                    if 5 < radius < 150:
+                        self.last_method = 'HSV'
+                        return (int(cx), int(cy), int(radius))
+        
+        self.last_method = None
+        return None
+
+
+# ==================== DEPTH FUNCTIONS ====================
+
+def get_robust_depth(depth_map: sl.Mat, point_cloud: sl.Mat,
+                     x: int, y: int, intrinsics: CameraIntrinsics,
+                     sample_radius: int = 5) -> Tuple[Optional[np.ndarray], float]:
+    """Get robust 3D position using multi-point sampling
+    
+    ZED coordinate system:
+    - +X: right
+    - +Y: up  
+    - +Z: into camera (so objects in front have NEGATIVE Z)
+    
+    For trajectory prediction, we negate Z so forward distance is positive.
+    """
+    h, w = depth_map.get_height(), depth_map.get_width()
+    valid_points = []
+    
+    for dy in range(-sample_radius, sample_radius + 1, 2):
+        for dx in range(-sample_radius, sample_radius + 1, 2):
+            px, py = x + dx, y + dy
+            if 0 <= px < w and 0 <= py < h:
+                err, point = point_cloud.get_value(px, py)
+                if err == sl.ERROR_CODE.SUCCESS and np.isfinite(point[2]):
+                    # Negate Z: ZED has +Z into camera, we want +Z forward into scene
+                    valid_points.append([point[0], point[1], -point[2]])
+    
+    if not valid_points:
+        return None, 0.0
+    
+    valid_points = np.array(valid_points)
+    median_point = np.median(valid_points, axis=0)
+    confidence = len(valid_points) / ((2 * sample_radius + 1) ** 2)
+    
+    return median_point, confidence
 
 
 # ==================== VISUALIZATION ====================
 
-def draw_trajectory_overlay(frame: np.ndarray, 
-                           predictor: TrajectoryPredictor,
-                           prediction: Optional[LandingPrediction],
-                           current_pos: Optional[np.ndarray],
-                           udp_sender: Optional[UDPSender] = None):
-    """Draw trajectory prediction overlay on frame"""
+def project_to_2d(point_3d: np.ndarray, intrinsics: CameraIntrinsics) -> Optional[Tuple[int, int]]:
+    """Project 3D point to 2D pixel coordinates"""
+    if point_3d[2] <= 0:
+        return None
+    px = int(point_3d[0] * intrinsics.fx / point_3d[2] + intrinsics.cx)
+    py = int(-point_3d[1] * intrinsics.fy / point_3d[2] + intrinsics.cy)
+    if 0 <= px < intrinsics.width and 0 <= py < intrinsics.height:
+        return (px, py)
+    return None
+
+
+def draw_overlay(frame: np.ndarray, predictor: TrajectoryPredictor,
+                 current_pos: Optional[np.ndarray], detection_method: Optional[str],
+                 intrinsics: CameraIntrinsics, udp_sender: Optional[UDPSender]):
+    """Draw trajectory prediction overlay"""
     h, w = frame.shape[:2]
     y = 30
     
     # Header
-    cv.putText(frame, "Trajectory Predictor", (10, y),
+    cv.putText(frame, "YOLO Trajectory Predictor", (10, y),
               cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     y += 25
     
@@ -667,123 +645,131 @@ def draw_trajectory_overlay(frame: np.ndarray,
         status_text = "ON" if udp_sender.enabled else "OFF"
         cv.putText(frame, f"{udp_status} [{status_text}]", (10, y),
                   cv.FONT_HERSHEY_SIMPLEX, 0.45, udp_color, 1)
-        y += 25
+        y += 20
     
-    # Throw status - more detailed
-    if predictor.prediction_locked:
-        throw_status = "PREDICTION LOCKED"
-        throw_color = (255, 0, 255)  # Magenta - indicates locked state
-    elif predictor.throw_confirmed:
-        throw_status = "THROW CONFIRMED"
-        throw_color = (0, 255, 0)  # Green
-    elif predictor.high_velocity_frames > 0:
-        throw_status = f"DETECTING ({predictor.high_velocity_frames}/{THROW_CONFIRM_FRAMES})"
-        throw_color = (0, 255, 255)  # Yellow
+    # Detection status
+    if current_pos is not None:
+        method_str = f" ({detection_method})" if detection_method else ""
+        cv.putText(frame, f"Ball: TRACKING{method_str}", (10, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, 
+                  (0, 255, 0) if detection_method == 'YOLO' else (255, 255, 0), 1)
     else:
-        throw_status = "WAITING FOR THROW"
-        throw_color = (150, 150, 150)  # Gray
-    
-    cv.putText(frame, f"Status: {throw_status}", (10, y),
-              cv.FONT_HERSHEY_SIMPLEX, 0.5, throw_color, 1)
+        cv.putText(frame, "Ball: SEARCHING", (10, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
     y += 20
     
-    # Show "Press R to reset" when locked
-    if predictor.prediction_locked:
+    # Prediction status
+    if predictor.locked:
+        cv.putText(frame, "Status: PREDICTION LOCKED", (10, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+        y += 20
         cv.putText(frame, "Press [R] to reset for next throw", (10, y),
                   cv.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-        y += 20
-    
-    # Trajectory points count
-    cv.putText(frame, f"Trajectory Points: {len(predictor.trajectory_history)}", (10, y),
-              cv.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-    y += 20
-    
-    # Show current speed
-    if predictor.last_velocity is not None:
-        speed = np.linalg.norm(predictor.last_velocity)
-        speed_color = (0, 255, 0) if speed > THROW_VELOCITY_THRESHOLD else (200, 200, 200)
-        cv.putText(frame, f"Speed: {speed:.2f} m/s (threshold: {THROW_VELOCITY_THRESHOLD})", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.4, speed_color, 1)
-        y += 20
+    elif predictor.n > 0:
+        cv.putText(frame, f"Status: TRACKING ({predictor.n} pts)", (10, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    else:
+        cv.putText(frame, "Status: WAITING FOR THROW", (10, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+    y += 25
     
     # Current position
     if current_pos is not None:
-        pos = np.asarray(current_pos).flatten()
-        cv.putText(frame, "Current Position (m):", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        y += 22
-        cv.putText(frame, f"  X: {pos[0]:+.3f}", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.45, (100, 200, 255), 1)
-        y += 18
-        cv.putText(frame, f"  Y: {pos[1]:+.3f}", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.45, (100, 255, 100), 1)
-        y += 18
-        cv.putText(frame, f"  Z: {pos[2]:+.3f}", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.45, (255, 100, 100), 1)
+        cv.putText(frame, f"Pos: X={current_pos[0]:+.2f} Y={current_pos[1]:+.2f} Z={current_pos[2]:+.2f}m", 
+                  (10, y), cv.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        y += 20
+    
+    # Velocity
+    vel = predictor._compute_velocity()
+    if vel is not None:
+        speed = np.linalg.norm(vel)
+        cv.putText(frame, f"Speed: {speed:.2f} m/s", (10, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
         y += 25
     
-    # Prediction info
-    if prediction:
-        pred_pos = np.asarray(prediction.position).flatten()
-        # Show different label if prediction is locked
-        if predictor.prediction_locked:
-            cv.putText(frame, "LOCKED PREDICTION:", (10, y),
-                      cv.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)  # Magenta for locked
-        else:
-            cv.putText(frame, "LANDING PREDICTION:", (10, y),
-                      cv.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-        y += 22
-        pred_color = (255, 0, 255) if predictor.prediction_locked else (0, 255, 0)
-        cv.putText(frame, f"  X: {pred_pos[0]:+.3f} m", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, pred_color, 1)
+    # Landing prediction
+    land = predictor.get_land()
+    if land:
+        label = "LOCKED" if predictor.locked else "PRED"
+        color = (255, 0, 255) if predictor.locked else (0, 255, 0)
+        cv.putText(frame, f"{label}: X={land.x:+.2f}m Z={land.z:+.2f}m", (10, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         y += 20
-        cv.putText(frame, f"  Z: {pred_pos[2]:+.3f} m", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, pred_color, 1)
-        y += 20
-        cv.putText(frame, f"  Time: {prediction.time_to_land:.2f} s", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, pred_color, 1)
-        y += 20
-        cv.putText(frame, f"  Confidence: {prediction.confidence:.0%}", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, pred_color, 1)
-    else:
-        cv.putText(frame, "Prediction: N/A", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1)
-        y += 20
-        # Show current confidence to help debug
-        conf = predictor.prediction_confidence
-        conf_color = (0, 255, 0) if conf >= MIN_PREDICTION_CONFIDENCE else (0, 128, 255)
-        cv.putText(frame, f"  Confidence: {conf:.0%} (need {MIN_PREDICTION_CONFIDENCE:.0%})", (10, y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.4, conf_color, 1)
+        cv.putText(frame, f"Time: {land.time:.2f}s  Conf: {land.confidence:.0%}", (10, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
     
-    # Instructions at bottom
-    cv.putText(frame, "[R] Reset  [T] Tennis  [P] Paper  [U] Toggle UDP  [Q] Quit",
+    # Draw trajectory
+    traj = predictor.get_traj_pts(30)
+    if traj is not None:
+        pts_2d = [project_to_2d(pt, intrinsics) for pt in traj]
+        pts_2d = [p for p in pts_2d if p is not None]
+        for i in range(1, len(pts_2d)):
+            prog = i / len(pts_2d)
+            cv.line(frame, pts_2d[i-1], pts_2d[i], 
+                   (0, int(255*(1-prog)), int(255*prog)), 2)
+    
+    # Draw landing marker
+    if land:
+        lp = project_to_2d(land.pos, intrinsics)
+        if lp:
+            cv.circle(frame, lp, 15, (0, 0, 255), 2)
+            cv.drawMarker(frame, lp, (0, 0, 255), cv.MARKER_CROSS, 20, 2)
+    
+    # Draw initial position
+    ip = predictor.get_init_pos()
+    if ip is not None:
+        ip2d = project_to_2d(ip, intrinsics)
+        if ip2d:
+            cv.circle(frame, ip2d, 8, (0, 255, 0), 2)
+    
+    # Instructions
+    cv.putText(frame, "[R] Reset  [T] Tennis  [P] Paper  [U] UDP  [Q] Quit",
               (10, h - 10), cv.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
 
 # ==================== MAIN ====================
 
 def main():
-    parser = argparse.ArgumentParser(description='Ball trajectory prediction')
-    parser.add_argument('--debug', '-d', action='store_true',
-                       help='Enable debug visualization')
+    parser = argparse.ArgumentParser(description='YOLO Trajectory prediction')
     parser.add_argument('--robot-ip', type=str, default=DEFAULT_ROBOT_IP,
                        help=f'Robot IP address (default: {DEFAULT_ROBOT_IP})')
     parser.add_argument('--port', type=int, default=DEFAULT_ROBOT_PORT,
                        help=f'UDP port (default: {DEFAULT_ROBOT_PORT})')
     parser.add_argument('--no-udp', action='store_true',
                        help='Disable UDP sending')
+    parser.add_argument('--no-gpu', action='store_true',
+                       help='Disable GPU acceleration for YOLO')
     parser.add_argument('--send-prediction', action='store_true',
                        help='Send predicted landing position instead of current position')
     args = parser.parse_args()
     
     print("\n" + "=" * 60)
-    print("  TRAJECTORY PREDICTOR - BALL LANDING ESTIMATION")
+    print("  YOLO TRAJECTORY PREDICTOR - BALL LANDING ESTIMATION")
+    print("  Camera parameters from: ../camera_parameters/")
     print("=" * 60)
+    
+    # Load camera parameters from files
+    print("\n✓ Loading camera parameters from files...")
+    try:
+        cam_params = load_camera_parameters_from_files()
+    except FileNotFoundError as e:
+        print(f"\n✗ ERROR: {e}")
+        print("  Make sure camera parameter files exist in ../camera_parameters/")
+        return
+    
+    intrinsics = CameraIntrinsics(
+        fx=cam_params.fx,
+        fy=cam_params.fy,
+        cx=cam_params.cx,
+        cy=cam_params.cy,
+        width=cam_params.width,
+        height=cam_params.height
+    )
     
     # Initialize UDP sender
     udp_sender = None
     if not args.no_udp:
-        udp_sender = UDPSender(args.robot_ip, args.port, rate_limit=30)
+        udp_sender = UDPSender(args.robot_ip, args.port, rate_limit=UDP_SEND_RATE)
         print(f"✓ UDP sender: {args.robot_ip}:{args.port}")
     else:
         print("✗ UDP sending disabled")
@@ -806,67 +792,14 @@ def main():
         return
     
     print("✓ ZED camera opened")
-    
-    # Get camera intrinsics (handle different ZED SDK versions)
-    cam_info = zed.get_camera_information()
-    
-    # Try different attribute paths for calibration parameters
-    try:
-        calib = cam_info.camera_configuration.calibration_parameters.left_cam
-    except AttributeError:
-        try:
-            calib = cam_info.calibration_parameters.left_cam
-        except AttributeError:
-            try:
-                calib = cam_info.camera_configuration.calibration_parameters.left_cam
-            except AttributeError:
-                print("Warning: Could not get calibration from SDK, using defaults")
-                calib = None
-    
-    # Try different attribute paths for resolution
-    try:
-        res_width = cam_info.camera_configuration.camera_resolution.width
-        res_height = cam_info.camera_configuration.camera_resolution.height
-    except AttributeError:
-        try:
-            res_width = cam_info.camera_configuration.resolution.width
-            res_height = cam_info.camera_configuration.resolution.height
-        except AttributeError:
-            try:
-                res_width = cam_info.camera_resolution.width
-                res_height = cam_info.camera_resolution.height
-            except AttributeError:
-                # Fall back to resolution-based defaults
-                if RESOLUTION == sl.RESOLUTION.HD720:
-                    res_width, res_height = 1280, 720
-                elif RESOLUTION == sl.RESOLUTION.HD1080:
-                    res_width, res_height = 1920, 1080
-                else:
-                    res_width, res_height = 1280, 720
-    
-    # Build intrinsics
-    if calib is not None:
-        intrinsics = CameraIntrinsics(
-            fx=calib.fx, fy=calib.fy,
-            cx=calib.cx, cy=calib.cy,
-            width=res_width,
-            height=res_height
-        )
-    else:
-        # Default intrinsics for HD720
-        intrinsics = CameraIntrinsics(
-            fx=700.0, fy=700.0,
-            cx=res_width / 2, cy=res_height / 2,
-            width=res_width,
-            height=res_height
-        )
-    
     print(f"✓ Camera: {intrinsics.width}x{intrinsics.height}")
+    print(f"✓ Intrinsics: fx={intrinsics.fx:.2f}, fy={intrinsics.fy:.2f}")
     print("=" * 60)
     
     # Initialize components
-    detector = BallDetector(ACTIVE_HSV)
-    predictor = TrajectoryPredictor(debug=args.debug)
+    use_gpu = USE_GPU and not args.no_gpu
+    detector = BallDetector(ACTIVE_HSV, use_gpu=use_gpu)
+    predictor = TrajectoryPredictor(GRAVITY, GROUND_Y)
     
     # Runtime parameters
     runtime = sl.RuntimeParameters()
@@ -880,20 +813,17 @@ def main():
     print("\nStarting trajectory prediction...")
     print("Throw the ball to see landing prediction!\n")
     
-    last_prediction = None
-    frame_counter = 0  # For PREDICTION_INTERVAL optimization
+    fps_q = deque(maxlen=30)
     
     try:
         while True:
+            t0 = time.time()
+            
             # Grab frame
             if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 continue
             
-            frame_counter += 1
             current_time = time.time()
-            
-            # Check for timeout
-            predictor.check_timeout(current_time)
             
             # Retrieve images
             zed.retrieve_image(image_left, sl.VIEW.LEFT)
@@ -901,15 +831,13 @@ def main():
             zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA)
             
             frame = image_left.get_data()[:, :, :3].copy()
-            hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
             
             # Detect ball
-            detection = detector.detect(hsv)
+            detection = detector.detect(frame)
             
             current_pos = None
-            prediction = None
             
-            if detection:
+            if detection and not predictor.locked:
                 x, y, radius = detection
                 
                 # Get 3D position
@@ -923,106 +851,41 @@ def main():
                     current_pos[1] += CAMERA_HEIGHT_ABOVE_GROUND
                     current_pos[2] += DEPTH_OFFSET
                     
-                    # Add to trajectory
-                    predictor.add_point(current_pos, current_time)
-                    
-                    # Predict landing (only every PREDICTION_INTERVAL frames for performance)
-                    # and only if no prediction has been locked yet
-                    should_predict = (frame_counter % PREDICTION_INTERVAL == 0) and not predictor.prediction_locked
-                    
-                    if should_predict:
-                        prediction = predictor.predict_landing()
-                        if prediction:
-                            last_prediction = prediction
-                            # Mark prediction as made and call logging
-                            predictor.prediction_made = True
-                            predictor.prediction_locked = True
-                            # Get velocity for logging
-                            _, current_vel = predictor.kalman_filter.get_state()
-                            predictor._save_and_print_prediction(prediction, current_pos, current_vel)
-                        elif args.debug:
-                            # Show why prediction failed
-                            print(f"[MAIN] Throw confirmed: {predictor.throw_confirmed}, Points: {len(predictor.trajectory_history)}, High-vel frames: {predictor.high_velocity_frames}")
+                    # Update predictor
+                    predictor.update(current_pos, current_time)
                     
                     # Send coordinates via UDP
                     if udp_sender and udp_sender.enabled:
-                        if args.send_prediction and prediction:
-                            # Send predicted landing position
-                            udp_sender.send_coordinates(
-                                prediction.position[0],
-                                prediction.position[1],
-                                prediction.position[2]
-                            )
+                        land = predictor.get_land()
+                        if args.send_prediction and land and predictor.locked:
+                            udp_sender.send_coordinates(land.x, land.y, land.z)
                         else:
-                            # Send current position
                             udp_sender.send_coordinates(
-                                current_pos[0],
-                                current_pos[1],
-                                current_pos[2]
+                                current_pos[0], current_pos[1], current_pos[2]
                             )
                     
                     # Draw detection
-                    draw_detection(frame, detection, "", (0, 255, 0))
+                    color = (0, 255, 0) if detector.last_method == 'YOLO' else (255, 255, 0)
+                    cv.circle(frame, (x, y), radius, color, 2)
+                    cv.circle(frame, (x, y), 3, color, -1)
                 else:
-                    draw_detection(frame, detection, "", (0, 165, 255))
+                    cv.circle(frame, (x, y), radius, (0, 165, 255), 2)
+            elif detection:
+                x, y, radius = detection
+                cv.circle(frame, (x, y), radius, (255, 0, 255), 2)
             
-            # Use last prediction if no new one
-            display_prediction = prediction if prediction else last_prediction
-            
-            # Draw trajectory history on frame (project 3D to 2D)
-            # Only draw every 2nd point for performance
-            traj_len = len(predictor.trajectory_history)
-            if traj_len > 1:
-                step = max(1, traj_len // 15)  # Draw max ~15 points
-                for i in range(0, traj_len, step):
-                    point = predictor.trajectory_history[i]
-                    pos = np.asarray(point.position).flatten()
-                    if len(pos) >= 3 and pos[2] > 0:
-                        px = int(pos[0].item() * intrinsics.fx / pos[2].item() + intrinsics.cx)
-                        py = int(-pos[1].item() * intrinsics.fy / pos[2].item() + intrinsics.cy)
-                        if 0 <= px < frame.shape[1] and 0 <= py < frame.shape[0]:
-                            alpha = i / traj_len
-                            color = (int(255 * (1 - alpha)), int(255 * alpha), 0)
-                            cv.circle(frame, (px, py), 3, color, -1)
-            
-            # Draw predicted trajectory (only every 3rd segment for performance)
-            if display_prediction and display_prediction.trajectory_points:
-                pts = display_prediction.trajectory_points
-                step = max(1, len(pts) // 7)  # Draw ~7 segments
-                for i in range(0, len(pts) - 1, step):
-                    pt = np.asarray(pts[i]).flatten()
-                    if len(pt) >= 3 and pt[2] > 0:
-                        px1 = int(pt[0].item() * intrinsics.fx / pt[2].item() + intrinsics.cx)
-                        py1 = int(-pt[1].item() * intrinsics.fy / pt[2].item() + intrinsics.cy)
-                        
-                        next_idx = min(i + step, len(pts) - 1)
-                        pt2 = np.asarray(pts[next_idx]).flatten()
-                        if len(pt2) >= 3 and pt2[2] > 0:
-                            px2 = int(pt2[0].item() * intrinsics.fx / pt2[2].item() + intrinsics.cx)
-                            py2 = int(-pt2[1].item() * intrinsics.fy / pt2[2].item() + intrinsics.cy)
-                            
-                            if (0 <= px1 < frame.shape[1] and 0 <= py1 < frame.shape[0] and
-                                0 <= px2 < frame.shape[1] and 0 <= py2 < frame.shape[0]):
-                                cv.line(frame, (px1, py1), (px2, py2), (0, 255, 255), 2)
-            
-            # Draw landing marker
-            if display_prediction:
-                lp = np.asarray(display_prediction.position).flatten()
-                if len(lp) >= 3 and lp[2] > 0:
-                    lpx = int(lp[0].item() * intrinsics.fx / lp[2].item() + intrinsics.cx)
-                    lpy = int(-lp[1].item() * intrinsics.fy / lp[2].item() + intrinsics.cy)
-                    if 0 <= lpx < frame.shape[1] and 0 <= lpy < frame.shape[0]:
-                        cv.drawMarker(frame, (lpx, lpy), (0, 0, 255), 
-                                     cv.MARKER_CROSS, 30, 3)
-                        cv.putText(frame, "LANDING", (lpx + 10, lpy - 10),
-                                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            # FPS
+            fps_q.append(time.time() - t0)
+            fps = 1.0 / (sum(fps_q) / len(fps_q))
+            cv.putText(frame, f"FPS: {fps:.0f}", (frame.shape[1] - 80, 25),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # Draw overlay
-            draw_trajectory_overlay(frame, predictor, display_prediction, 
-                                   current_pos, udp_sender)
+            draw_overlay(frame, predictor, current_pos, detector.last_method, 
+                        intrinsics, udp_sender)
             
             # Display
-            cv.imshow("Trajectory Predictor", frame)
+            cv.imshow("YOLO Trajectory Predictor", frame)
             
             # Handle keyboard input
             key = cv.waitKey(1) & 0xFF
@@ -1030,7 +893,6 @@ def main():
                 break
             elif key == ord('r'):
                 predictor.reset()
-                last_prediction = None
             elif key == ord('t'):
                 detector.set_hsv_range(HSV_TENNIS_BALL['lower'], HSV_TENNIS_BALL['upper'])
                 print("[HSV] Tennis ball")

@@ -554,19 +554,19 @@ if __name__ == '__main__':
     print("ZED 2i STEREO CAMERA CALIBRATION")
 
     print("Capturing frames for individual camera calibration")
-    save_frames_single_camera_zed('left')  # save frames for left camera
-    save_frames_single_camera_zed('right')  # save frames for right camera
+    # save_frames_single_camera_zed('left')  # save frames for left camera
+    # save_frames_single_camera_zed('right')  # save frames for right camera
 
     print("Computing intrinsic parameters")
     images_prefix = os.path.join('frames', 'camera0*')
     print("Calibrating left camera (camera0)...")
     cmtx0, dist0 = calibrate_camera_for_intrinsic_parameters(images_prefix) 
-    save_camera_intrinsics(cmtx0, dist0, 'camera0')
+    # save_camera_intrinsics(cmtx0, dist0, 'camera0')
     
     images_prefix = os.path.join('frames', 'camera1*')
     print("Calibrating right camera (camera1)...")
     cmtx1, dist1 = calibrate_camera_for_intrinsic_parameters(images_prefix)
-    save_camera_intrinsics(cmtx1, dist1, 'camera1')
+    # save_camera_intrinsics(cmtx1, dist1, 'camera1')
 
 
     print("Capturing synchronized stereo pairs")
