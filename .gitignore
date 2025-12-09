@@ -2,5 +2,6 @@ __pycache__
 zed2i/ball_tracking_log.csv
 zed2i/landing_predictions.csv
 zed2i/predictions.txt
+zed2i/yolov8n.pt
 realsense/yolo5_last.pt
 realsense/yolov8n.pt

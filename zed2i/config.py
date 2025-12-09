@@ -35,7 +35,7 @@ DEFAULT_FPS = 30
 # ==================== UDP COMMUNICATION ====================
 
 # Robot UDP Configuration
-DEFAULT_ROBOT_IP = "192.168.0.155"
+DEFAULT_ROBOT_IP = "192.168.0.248"
 DEFAULT_ROBOT_PORT = 5005
 UDP_SEND_RATE = 30  # Hz - how often to send coordinates
 
